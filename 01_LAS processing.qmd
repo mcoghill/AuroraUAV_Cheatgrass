@@ -1,0 +1,19 @@
+---
+title: "01_LAS Processing"
+format: html
+editor: visual
+---
+
+## LAS processing
+
+This should be the first script to be run before modelling occurs. There are a number of items that need to happen - First, DEM's need to be created from LAS files at a 0.5m\^2 resolution. These DEM's will then need to be trimmed to their respective flight areas, and then mosaicked together using SAGA GIS. Once there is a single DEM for each camera, then SAGA GIS can be used to create the DEM derivatives. The reflectance layers can then be resampled to match the extents of the DEM derived layers as well.
+
+First, load packages
+
+```{r}
+
+library(tidyverse)
+library(terra)
+library(sf)
+library(lidR)
+```
