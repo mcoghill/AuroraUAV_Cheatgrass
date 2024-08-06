@@ -16,4 +16,519 @@ library(tidyverse)
 library(terra)
 library(sf)
 library(lidR)
+library(future.apply)
+library(Rsagacmd)
+library(ClimateNAr)
+library(data.table)
+library(RStoolbox)
+setDTthreads(0)
+```
+
+The files that we will be working with are located on the Synology drive. File access may be granted by contacting info\@aurorauav.com
+
+```{r}
+syn_path <- file.path(Sys.getenv("USERPROFILE"), "SynologyDrive/Cheatgrass")
+las_files <- list.files(file.path(syn_path, "Processed Imagery/2024"),
+  pattern = ".las$", full.names = TRUE, recursive = TRUE)
+
+# Remove SC-A14
+las_files <- grep("SC-A14_", las_files, invert = TRUE, value = TRUE)
+
+# Get clipping areas (KMZ)
+kmz_files <- list.files(
+  file.path(syn_path, "KML Flight Areas/2024 Kam Lk fillin KMLs"), 
+  full.names = TRUE, pattern = ".kmz$")
+kmz_files <- grep("SC-A14-|SC-A14.kmz|CC-A15.kmz", kmz_files, invert = TRUE, value = TRUE)
+
+# Unzip KMZ to KML
+kml_dir <- file.path(dirname(kmz_files[1]))
+lapply(kmz_files, function(x) {
+  if(!file.exists(file.path(kml_dir, sub(".kmz$", ".kml", basename(x))))) {
+    kml <- grep(".kml$", unzip(x, list = TRUE)[, "Name"], value = TRUE)
+    unzip(x, files = kml, exdir = kml_dir)
+    file.rename(file.path(kml_dir, kml),
+                file.path(kml_dir, sub(".kmz$", ".kml", basename(x))))
+    return(invisible())
+  }
+})
+kml_files <- list.files(
+  file.path(syn_path, "KML Flight Areas/2024 Kam Lk fillin KMLs"), 
+  full.names = TRUE, pattern = ".kml$")
+
+# Set up processing folders
+las_tile_dirs <- file.path("Kamloops Lake_AOI/01_tile",  basename(dirname(las_files)))
+sapply(las_tile_dirs, dir.create, showWarnings = FALSE, recursive = TRUE)
+
+```
+
+LAS tile processing
+
+```{r}
+
+# Cleaning function
+ctg_clean <- function(las) {
+  las <- classify_noise(las, ivf(res = 4, n = 15))
+  las <- filter_poi(las, Classification != LASNOISE)
+  las <- classify_ground(las, csf(sloop_smooth = TRUE, class_threshold = 0.1, cloth_resolution = 0.25))
+  return(las)
+}
+
+las_tile_dirs <- dir("Kamloops Lake_AOI/01_tile", full.names = TRUE)
+las_clean_dir <- file.path("Kamloops Lake_AOI/02_clean")
+dem_out <- file.path("Kamloops Lake_AOI/03_dem")
+dir.create(las_clean_dir, showWarnings = FALSE)
+dir.create(dem_out, showWarnings = FALSE)
+set_lidr_threads(1)
+plan(list(
+  tweak(multisession, workers = availableCores() %/% 4),
+  tweak(multisession, workers = I(3))
+))
+dems <- future_lapply(las_tile_dirs, function(x) {
+  set_lidr_threads(1)
+  las_file <- grep(basename(x), las_files, value = TRUE)
+  ctg <- readLAScatalog(las_file, chunk_size = 250, chunk_buffer = 0)
+  opt_output_files(ctg) <- file.path(x, "{XLEFT}_{YBOTTOM}")
+  opt_chunk_alignment(ctg) <- c(250, 250)
+  ctg_tile <- catalog_retile(ctg)
+  ctg_tile <- readLAScatalog(x, chunk_buffer = 12.5)
+  opt_output_files(ctg_tile) <- file.path(las_clean_dir, basename(x), "{*}")
+  ctg_cleaned <- catalog_map(ctg_tile, ctg_clean)
+  ctg_cleaned <- readLAScatalog(file.path(las_clean_dir, basename(x)), chunk_buffer = 12.5)
+  dem <- rasterize_terrain(ctg_cleaned, res = 0.5, algorithm = tin())
+  kml <- vect(grep(basename(x), kml_files, value = TRUE)) %>% 
+    project(dem)
+  dem_mask <- mask(dem, kml) %>% 
+    trim(filename = file.path(
+      dem_out, paste0(basename(x), "_dem.tif")), overwrite = TRUE)
+}, future.seed = NULL)
+```
+
+```{r}
+
+cameras <- data.frame(
+  dem = list.files(dem_out, full.names = TRUE, pattern = ".tif$"),
+  las = las_files) %>% 
+  mutate(camera = ifelse(grepl("_RGB_group1_", las), "M3M", "Altum")) %>% 
+  select(-las)
+```
+
+There should be a chunk here to get the DEM's all mosaicked together; alas, this was done manually in SAGA GIS. Now, use those DEM's to get climate variables needed for this project.
+
+```{r}
+dem_files <- c(
+  "C:/Users/mcoghill/SynologyDrive/Cheatgrass/Model Layers/Kamloops Lake/Altum_update/Altum_DEM.tif",
+  "C:/Users/mcoghill/SynologyDrive/Cheatgrass/Model Layers/Kamloops Lake/M3M_update/M3M_DEM.tif"
+)
+
+options(future.globals.maxSize = 10 * 1024^3)
+
+climbc_dems <- lapply(dem_files, function(dem_x) {
+  
+  # Set input (DEM) and output paths
+  dem_in <- dem_x
+  dem_wgs84_out <- gsub(".tif$", ".csv", dem_in)
+  
+  # 3) Project your DEM from your base CRS to 4326 (lat/long).
+  # Load template DEM (note: can be in memory as well) - should be in different CRS
+  dem <- rast(dem_in)
+  
+  # Project the DEM to 4326 (projection required for ClimateBC)
+  dem_wgs84 <- project(dem, "EPSG:4326", method = "bilinear", threads = TRUE)
+  dem_dt <- as.data.table(dem_wgs84, cells = TRUE, xy = TRUE, na.rm = TRUE)
+  setcolorder(dem_dt, "y", before = "x")
+  fwrite(dem_dt, dem_wgs84_out, row.names = TRUE, showProgress = FALSE)
+  return(dem_wgs84)
+})
+  
+# 4) Create a table of all climate variables you want to generate
+# This can be done simply with a data.frame() function, or expand.grid() as well.
+
+clim_table <- expand.grid(
+  dem_in = gsub(".tif$", ".csv", dem_files),
+  period = c("Year_2022.ann", "Normal_1991_2020.nrm"),
+  MSY = c("S", "Y"), stringsAsFactors = FALSE)
+
+# 4) Run ClimateBC (can be done in parallel with future.apply package)
+plan(multisession, workers = min(nrow(clim_table), availableCores()))
+
+# Need this for terra and future package:
+# dem <- sprc(dem_files)
+# dem_wgs84 <- sprc(climbc_dems)
+# names(dem_wgs84) <- sapply(climbc_dems, names)
+# .r <- wrap(dem)
+# .r2 <- wrap(dem_wgs84)
+
+# Essentially a reusable function here: it takes your input DEM and generates
+# all climate layers from the scenarios and time scales that you define. The
+# ClimateNA_cmdline function writes TIF files in EPSG 4326. These need to be 
+# changed to your template DEM projection. Extra care is taken for projection
+# based on whether or not the datatypes are integer or floating point values.
+full_clim_run <- future_lapply(1:nrow(clim_table), function(x) {
+  
+  # dem <- unwrap(.r)
+  # dem_wgs84 <- unwrap(.r2)
+  # if(grepl("Altum", clim_table[x, "dem_in"])) {
+  #   dem <- dem[which(names(dem) == "Altum_DEM")]
+  #   dem_wgs84 <- dem_wgs84[which(names(dem_wgs84) == "Altum_DEM")]
+  # } else {
+  #   dem <- dem[which(names(dem) == "M3M_DEM")]
+  #   dem_wgs84 <- dem_wgs84[which(names(dem_wgs84) == "M3M_DEM")]
+  # }
+  climbc_exe <- "C:/ClimateBC/Climatebc_v750/ClimateBC_v7.50.exe"
+  climbc <- normalizePath(climbc_exe)
+  period <- clim_table[x, "period"]
+  MSY <- clim_table[x, "MSY"]
+  infile <- normalizePath(clim_table[x, "dem_in"])
+  out_dest <- dirname(infile) # Where to put the climate layers
+  out_fname <- gsub("@", "_", paste0(tools::file_path_sans_ext(period), MSY, ".csv"))
+  clim_out <- normalizePath(file.path(out_dest, out_fname), mustWork = FALSE)
+  
+  # Run the function
+  clim_run <- ClimateNA_cmdLine(
+    exe = basename(climbc), wkDir = dirname(climbc), period = period, MSY = MSY,
+    inputFile = infile, outputFile = clim_out)
+  
+}, future.seed = NULL)
+plan(sequential)
+# rm(.r, .r2)
+
+full_clim_run <- lapply(1:nrow(clim_table), function(x) {
+  
+  cam <- tools::file_path_sans_ext(basename(clim_table[x, "dem_in"]))
+  dem <- rast(grep(cam, dem_files, value = TRUE))
+  dem_wgs84 <- climbc_dems[[grep(cam, sapply(climbc_dems, names))]]
+  
+  # need for below
+  v_missing <- data.table(cell = 1:ncell(dem_wgs84))
+  
+  period <- clim_table[x, "period"]
+  MSY <- clim_table[x, "MSY"]
+  infile <- normalizePath(clim_table[x, "dem_in"])
+  out_dest <- dirname(infile) # Where to put the climate layers
+  out_fname <- gsub("@", "_", paste0(tools::file_path_sans_ext(period), MSY, ".csv"))
+  clim_out <- normalizePath(file.path(out_dest, out_fname), mustWork = FALSE)
+  
+  # Load CSV
+  # Heading names
+  clim_vars <- fread(clim_out, header = TRUE, nrows = 0) %>% 
+    select(-c(1:5)) %>% 
+    names()
+  
+  aaa <- do.call(c, lapply(clim_vars, function(cvars) {
+    # proj_method <- ifelse(
+    #   grepl("Tmax|Tmin|Tave|MAT|MWMT|MCMT|TD|AHM|SHM|EMT|EXT|CMI", cvars),
+    #   "bilinear", "near")
+    # proj_type <- ifelse(proj_method == "bilinear", "FLT4S", "INT2S")
+    v <- fread(clim_out, select = c("cell", cvars), na.strings = "-9999",
+               showProgress = FALSE)
+    col_type <- class(v[[2]])
+    if(col_type %in% c("numeric", "integer")) {
+      proj_method <- ifelse(col_type == "numeric", "bilinear", "near")
+      proj_type <- ifelse(col_type == "numeric", "FLT4S", "INT2S")
+      v <- merge(v_missing, v, by = "cell", all = TRUE, sort = TRUE)
+      
+      r <- rast(nrows = nrow(dem_wgs84), ncols = ncol(dem_wgs84), 
+                nlyrs = 1, 
+                xmin = xmin(dem_wgs84), xmax = xmax(dem_wgs84), 
+                ymin = ymin(dem_wgs84), ymax = ymax(dem_wgs84),
+                crs = "EPSG:4326", extent = ext(dem_wgs84),
+                resolution = res(dem_wgs84), names = names(v)[2])
+      
+      gc()
+      
+      clim_project <- do.call(c, lapply(1:nchar(MSY), function(y) {
+        
+        # Get the time scale variable
+        var_type <- substr(MSY, y, y)
+        
+        # Gather either monthly, seasonal, or annual names:
+        # r_files <- list.files(clim_run_path, pattern = ".tif$", full.names = TRUE)
+        if(var_type == "M") {
+          r_filt <- names(r)[grep("[0-9]{2}$", names(r))]
+          r_filt <- grep("DD_18|DD1040|DD18", r_filt, 
+                         value = TRUE, invert = TRUE)
+        } else if(var_type == "S") {
+          r_filt <- grep("_at|_sm|_sp|_wt", names(r), value = TRUE)
+        } else {
+          r_filt <- names(r)[grep("[0-9]{2}$", names(r), invert = TRUE)]
+          r_filt <- grep("_at|_sm|_sp|_wt", r_filt, value = TRUE, invert = TRUE)
+          r_filt <- c(r_filt, "DD_18", "DD1040", "DD18")
+        }
+        
+        # Read in the files, but rename the layers to reflect the model name and time
+        # scale of the variable.
+        new_name <- gsub("@", "_", paste0(
+          tools::file_path_sans_ext(period), var_type, "_", names(r)))
+        names(r) <- new_name
+        print(paste("Projecting and writing", new_name))
+        values(r) <- v[[2]]
+        clim_proj <- project(
+          r, dem, method = proj_method, threads = TRUE,
+          filename = file.path(out_dest, paste0(names(r), ".tif")),
+          datatype = proj_type, overwrite = TRUE)
+        
+        gc()
+        return(clim_proj)
+      }))
+    } else return(NULL)
+    
+  }))
+  
+  
+  
+  # for(i in 1:nlyr(r)) {
+  #   r[[i]] <- setValues(r[[i]], v[, i+1])
+  # }
+  # r[v$cell] <- v[, -c(1:3)]
+  
+  # Create a string of the file path of where those TIF files are located
+  # clim_run_path <- gsub("\\\\", "/", paste0(
+  #   clim_out, tools::file_path_sans_ext(period), MSY))
+  
+  # Saves TIF files that are in 4326. Need to reproject and write them to destination
+  # folder; need to do this by the time scale for the folder structure.
+  
+  unlink(clim_out)
+  return(sources(aaa))
+})
+
+# Sanity check: do all of the output rasters align again?
+clim_files <- unique(do.call(c, full_clim_run))
+clim_lyrs <- c(dem, rast(clim_files))
+```
+
+```{r}
+
+# Multispectral
+# 1) Get folders
+ms_dirs <- list.dirs(
+  "C:/Users/mcoghill/SynologyDrive/Cheatgrass/Processed Imagery/2024",
+  full.names = TRUE, recursive = TRUE)
+
+ms_dirs <- grep("Reflectance$", ms_dirs, value = TRUE)
+ms_dirs <- grep("SC-A14_2024-07-20", ms_dirs, invert = TRUE, value = TRUE)
+ms_camera <- data.frame(dir = ms_dirs) %>% 
+  mutate(camera = sapply(ms_dirs, function(x) {
+    ifelse(length(list.files(x, pattern = ".tif$")) == 4, "M3M", "Altum")
+  }))
+
+# Resample all images to lower resolution
+dem_files <- c(
+  "C:/Users/mcoghill/SynologyDrive/Cheatgrass/Model Layers/Kamloops Lake/Altum_update/Altum_DEM.tif",
+  "C:/Users/mcoghill/SynologyDrive/Cheatgrass/Model Layers/Kamloops Lake/M3M_update/M3M_DEM.tif"
+)
+plan(multisession, workers = min(availableCores(), nrow(ms_camera)))
+ms_lowres <- do.call(c, future_lapply(1:nrow(ms_camera), function(x) {
+  r_in <- list.files(ms_camera[x, "dir"], full.names = TRUE, pattern = ".tif$")
+  if(!any(endsWith(r_in, "05.tif"))) {
+    dem <- ifelse(ms_camera[x, "camera"] == "Altum", dem_files[1], dem_files[2])
+    dem <- rast(dem)
+    reflectance <- rast(r_in)
+    ref_resamp <- resample(reflectance, dem, method = "bilinear", threads = FALSE)
+    names(ref_resamp) <- paste0(names(ref_resamp), "_05")
+    fnames <- paste0(dirname(sources(reflectance)[1]), "/", names(ref_resamp), 
+                     ".tif")
+    ref_resamp <- writeRaster(ref_resamp, fnames, overwrite = TRUE)
+    return(ref_resamp)
+  } else return(NULL)
+}, future.seed = NULL))
+
+plan(multisession, workers = 3)
+ms_ind <- future_lapply(1:nrow(ms_camera), function(x) {
+  r <- rast(list.files(ms_camera[x, "dir"], pattern = "_05.tif$", 
+                       full.names = TRUE))
+  if(ms_camera[x, "camera"] == "Altum") {
+    s <- spectralIndices(
+      img = r,
+      blue = grep("_blue_05", names(r)),
+      green = grep("_green_05", names(r)),
+      red = grep("_red_05", names(r)),
+      nir = grep("_nir_05", names(r)),
+      redEdge2 = grep("_red edge_05", names(r))
+    )
+  } else {
+    s <- spectralIndices(
+      img = r,
+      green = grep("_green_05", names(r)),
+      red = grep("_red_05", names(r)),
+      nir = grep("_nir_05", names(r)),
+      redEdge2 = grep("_red edge_05", names(r))
+    )
+  }
+  fnames <- file.path(
+    dirname(ms_camera[x, "dir"]), "Indices",
+    paste0(basename(dirname(ms_camera[x, "dir"])), "_", names(s), ".tif"))
+  s <- writeRaster(s, fnames, overwrite = TRUE)
+  return(s)
+}, future.seed = NULL)
+
+plan(sequential)
+
+# Merge new files with old ones
+altum_orig <- list.files(
+  "C:/Users/mcoghill/SynologyDrive/Cheatgrass/Model Layers/Kamloops Lake/Multispectral_Indices/Altum",
+  full.names = TRUE, pattern = ".tif$")
+
+plan(multisession, workers = min(availableCores() / 2, length(altum_orig)))
+altum_ms <- lapply(altum_orig, function(x) {
+  pat <- gsub(".*_", "", basename(x))
+  ind_dirs <- gsub("Reflectance", "Indices", 
+                   ms_camera$dir[which(ms_camera$camera == "Altum")])
+  fnames <- c(
+    x, 
+    sapply(ind_dirs, list.files, full.names = TRUE, pattern = pat,
+           USE.NAMES = FALSE))
+  if(all(sapply(fnames, length) > 0)) {
+    rsrc <- sprc(lapply(fnames, rast))
+    out_path <- file.path(
+      "C:/Users/mcoghill/SynologyDrive/Cheatgrass/Model Layers/Kamloops Lake/Altum_update",
+      paste0("MS_", pat))
+    mos <- mosaic(rsrc, fun = "mean", filename = out_path, overwrite = TRUE)
+  } else return(NULL)
+})
+
+m3m_orig <- list.files(
+  "C:/Users/mcoghill/SynologyDrive/Cheatgrass/Model Layers/Kamloops Lake/Multispectral_Indices/M3M",
+  full.names = TRUE, pattern = ".tif$")
+
+plan(multisession, workers = min(availableCores() / 2, length(m3m_orig)))
+m3m_ms <- lapply(m3m_orig, function(x) {
+  pat <- gsub(".*_", "", basename(x))
+  ind_dirs <- gsub("Reflectance", "Indices", 
+                   ms_camera$dir[which(ms_camera$camera == "M3M")])
+  fnames <- c(
+    x, 
+    sapply(ind_dirs, list.files, full.names = TRUE, pattern = pat,
+           USE.NAMES = FALSE))
+  if(all(sapply(fnames, length) > 0)) {
+    rsrc <- sprc(lapply(fnames, rast))
+    out_path <- file.path(
+      "C:/Users/mcoghill/SynologyDrive/Cheatgrass/Model Layers/Kamloops Lake/M3M_update",
+      paste0("MS_", pat))
+    mos <- mosaic(rsrc, fun = "mean", filename = out_path, overwrite = TRUE)
+  } else return(NULL)
+})
+
+```
+
+```{r}
+
+saga_path <- "C:/SAGA-GIS/saga-9.5.1_x64/saga_cmd.exe"
+saga <- saga_gis(saga_path, raster_format = "GeoTIFF")
+
+dem_files <- c(
+  "C:/Users/mcoghill/SynologyDrive/Cheatgrass/Model Layers/Kamloops Lake/Altum_update/Altum_DEM.tif",
+  "C:/Users/mcoghill/SynologyDrive/Cheatgrass/Model Layers/Kamloops Lake/M3M_update/M3M_DEM.tif"
+)
+
+demp_path <- data.frame(
+  dem_in = dem_files,
+  dem_out = file.path("Kamloops Lake_AOI", "03_dem", paste0(
+    tools::file_path_sans_ext(basename(dem_files)), "_filled.tif")
+  ))
+
+dems_preproc <- lapply(1:nrow(demp_path), function(x) {
+  dem <- rast(demp_path[x, "dem_in"])
+  dem_preproc <- demp_path[x, "dem_out"]
+  saga$ta_preprocessor$sink_removal(
+    dem = dem, dem_preproc = dem_preproc)
+}) 
+
+od <- file.path(dirname(dem_files), "Terrain_")
+terrain_run <- lapply(1:nrow(demp_path), function(x) {
+  dem_preproc <- dems_preproc[[x]]
+  slope_aspect <- saga$ta_morphometry$slope_aspect_curvature(
+    elevation = dem_preproc, slope = paste0(od[x], "slope.tif"), 
+    aspect = paste0(od[x], "aspect.tif"), 
+    c_gene = paste0(od[x], "curvature_general.tif"),
+    c_tota = paste0(od[x], "curvature_total.tif"),
+    method = 6, unit_slope = "radians", unit_aspect = "radians",
+    .all_outputs = FALSE)
+  
+  ######### Morphometry layers
+  # MRVBF/MRRTF
+  mrvbf_thresh <- mrvbf_threshold(res = 0.5)
+  mrvbf <- saga$ta_morphometry$multiresolution_index_of_valley_bottom_flatness_mrvbf(
+    dem = dem_preproc, mrvbf = paste0(od[x], "mrvbf.tif"), 
+    mrrtf = paste0(od[x], "mrrtf.tif"), t_slope = mrvbf_thresh)
+  
+  # Convergence index
+  ci <- saga$ta_morphometry$convergence_index(
+    elevation = dem_preproc, result = paste0(od[x], "convergence_index.tif"))
+  
+  # Diurnal anisotropic heating
+  dah <- saga$ta_morphometry$diurnal_anisotropic_heat(
+    dem = dem_preproc, dah = paste0(od[x], "dah.tif"))
+  
+  # Topographic position index (takes a while to run)
+  tpi <- saga$ta_morphometry$topographic_position_index_tpi(
+    dem = dem_preproc, tpi = paste0(od[x], "tpi.tif"))
+  
+  # Terrain ruggedness index
+  tri <- saga$ta_morphometry$terrain_ruggedness_index_tri(
+    dem = dem_preproc, tri = paste0(od[x], "tri.tif"))
+  
+  ######### Hydrology layers
+  # Total catchment area, layer not needed for modelling
+  tca <- saga$ta_hydrology$flow_accumulation_top_down(
+    elevation = dem_preproc, flow = paste0(od[x], "tca_TEMP.tif"), 
+    .all_outputs = FALSE)
+  
+  # Specific catchment area, layer not needed for modelling
+  sca <- saga$ta_hydrology$flow_width_and_specific_catchment_area(
+    dem = dem_preproc, tca = tca, sca = paste0(od[x], "sca_TEMP.tif"), 
+    .all_outputs = FALSE)
+  
+  # Strahler stream order, layer not needed for modelling
+  so <- saga$ta_channels$strahler_order(
+    dem = dem_preproc, strahler = paste0(od[x], "strahler_TEMP.tif"), 
+    .all_outputs = FALSE)
+  
+  # Channel network, layer not needed for modelling - default initiation value of 
+  # 5 is based on this being a default value used in another tool
+  cn <- saga$ta_channels$channel_network(
+    elevation = dem_preproc, init_grid = so, init_value = 5,
+    chnlntwrk = paste0(od[x], "cn_TEMP.tif"), .all_outputs = FALSE)
+  
+  # Topographic wetness index
+  twi <- saga$ta_hydrology$topographic_wetness_index(
+    slope = slope_aspect$slope, area = sca, twi = paste0(od[x], "twi.tif"))
+  
+  # Overland flow distance
+  overland_flow <- saga$ta_channels$overland_flow_distance_to_channel_network(
+    elevation = dem_preproc, channels = cn, 
+    distance = paste0(od[x], "o_flow.tif"), 
+    disthorz = paste0(od[x], "o_flow_horiz.tif"), 
+    distvert = paste0(od[x], "o_flow_vert.tif"), boundary = FALSE, 
+    .all_outputs = FALSE)
+  
+  # Vertical distance to channel network
+  v_dist_cn <- saga$ta_channels$vertical_distance_to_channel_network(
+    elevation = dem_preproc, channels = cn,
+    distance = paste0(od[x], "vert_dist_cn.tif"), .all_outputs = FALSE)
+  
+  ######### Lighting/visibility layers
+  # Topographic openness
+  openness <- saga$ta_lighting$topographic_openness(
+    dem = dem_preproc, pos = paste0(od[x], "openness_pos.tif"), 
+    neg = paste0(od[x], "openness_neg.tif"))
+  
+  # Potential Incoming Solar Radiation
+  pisr <- saga$ta_lighting$potential_incoming_solar_radiation(
+    grd_dem = dem_preproc, 
+    grd_direct = paste0(od[x], "insolation_direct.tif"),
+    grd_diffus = paste0(od[x], "insolation_diffuse.tif"), 
+    location = 1, # Calculates latitude from grid
+    period = 2, # Defines range of days
+    day = "2022-01-15", day_stop = "2022-12-15", days_step = 30,
+    hour_range_min = 4, hour_range_max = 20, hour_step = 4, 
+    .all_outputs = FALSE, .verbose = TRUE)
+  
+  # Remove files tagged with "TEMP":
+  files_to_remove <- list.files(dirname(od[x]), pattern = "*._TEMP.tif$", 
+                                full.names = TRUE)
+  file.remove(files_to_remove)
+  saga_remove_tmpfiles()
+}) 
+
 ```
