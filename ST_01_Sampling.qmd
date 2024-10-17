@@ -118,5 +118,5 @@ sample_pts <- do.call(rbind, lapply(1:nrow(sample_area), function(x) {
   group_by(Name) %>% 
   mutate(Name = paste0("Block ", Name,"_P", 1:n()))
 
-st_write(sample_pts, "AuroraUAV_2024_SamplePts.kml", quiet = TRUE, delete_dsn = TRUE)
+st_write(sample_pts, "South Thompson_AOI/AuroraUAV_2024_SamplePts.kml", quiet = TRUE, delete_dsn = TRUE)
 ```
