@@ -1,0 +1,122 @@
+---
+title: "02_South Thompson Sampling"
+format: html
+editor: visual
+---
+
+## 
+
+```{r}
+
+library(tidyverse)
+library(sf)
+library(terra)
+library(raster)
+library(bcmaps)
+library(bcdata)
+library(Rsagacmd)
+library(clhs)
+
+saga_path <- "C:/SAGA-GIS/saga-9.5.1_x64/saga_cmd.exe"
+saga <- saga_gis(saga_path, raster_format = "GeoTIFF")
+```
+
+```{r}
+syd <- file.path("C:/Users/mcoghill/SynologyDrive/Cheatgrass")
+kmz <- file.path(syd, "KML Flight Areas/South Thompson Project Area/overall area/South Thompson Project Area - 2024.kmz")
+unzip(kmz, exdir = dirname(kmz))
+file.rename(file.path(dirname(kmz), "doc.kml"), 
+            file.path(dirname(kmz), "South Thompson Project Area - 2024.kml"))
+
+flight_areas <- st_read(file.path(dirname(kmz), "South Thompson Project Area - 2024.kml"), quiet = TRUE) %>% 
+  st_zm() %>% 
+  st_transform(3153) %>% 
+  filter(Name != "South Thompson Project Area")
+
+
+full_area <- flight_areas %>% 
+  st_union() %>% 
+  vect()
+
+full_area_sf <- st_as_sf(full_area)
+
+roads <- bcdc_query_geodata("bb060417-b6e6-4548-b837-f9060d94743e", crs = 3153) %>% 
+  filter(INTERSECTS(full_area_sf)) %>% 
+  collect() %>% 
+  st_intersection(full_area_sf) %>% 
+  st_geometry() %>% 
+  st_as_sf() %>%
+  mutate(road = 0)
+
+dem <- cded_terra(st_as_sf(full_area)) %>% 
+  project(crs(full_area)) %>% 
+  mask(full_area)
+
+roads_rast <- rasterize(vect(roads), dem, field = "road", filename = "roads.tif",
+                        overwrite = TRUE)
+roads_buf <- roads %>% 
+  st_buffer(25) %>% 
+  st_union()
+sample_area <- flight_areas %>% 
+  st_buffer(-35) %>% 
+  st_difference(roads_buf)
+
+# Produce some SAGA layers
+slope <- saga$ta_morphometry$slope_aspect_curvature(
+  elevation = dem, slope = "slope_temp.tif",
+  aspect = "aspect_temp.tif", unit_slope = 1, unit_aspect = 1,
+  .all_outputs = FALSE)
+aspect <- slope$aspect
+slope <- slope$slope
+
+# MRVBF/MRRTF
+mrvbf_thresh <- mrvbf_threshold(res = 15)
+mrvbf <- saga$ta_morphometry$multiresolution_index_of_valley_bottom_flatness_mrvbf(
+  dem = dem, mrvbf = "mrvbf.tif", 
+  mrrtf = "mrrtf.tif", t_slope = mrvbf_thresh)
+
+# Terrain ruggedness index
+tri <- saga$ta_morphometry$terrain_ruggedness_index_tri(
+  dem = dem, tri = "tri.tif")
+
+# Strahler stream order, layer not needed for modelling
+so <- saga$ta_channels$strahler_order(
+  dem = dem, strahler = "strahler_TEMP.tif", 
+  .all_outputs = FALSE)
+
+# Channel network, layer not needed for modelling - default initiation value of 
+# 5 is based on this being a default value used in another tool
+cn <- saga$ta_channels$channel_network(
+  elevation = dem, init_grid = so, init_value = 5,
+  chnlntwrk = "cn_TEMP.tif", .all_outputs = FALSE)
+
+# Vertical distance to channel network
+v_dist_cn <- saga$ta_channels$vertical_distance_to_channel_network(
+  elevation = dem, channels = cn,
+  distance = "vert_dist_cn.tif", .all_outputs = FALSE)
+
+# This should work but is currently not working (Rsagacmd package error)
+# cost <- saga$grid_analysis$accumulated_cost(
+#   dest_grid = roads_rast, cost = slope, dir_maxcost = aspect,
+#   accumulated = "cost.tif",
+#   dir_unit = 1, .verbose = TRUE)
+
+cost <- rast("cost.tif") %>% 
+  terra::resample(slope)
+varnames(cost) <- "cost"
+inlyrs <- raster::stack(c(slope, mrvbf$mrvbf, tri, v_dist_cn, cost))
+
+
+sample_pts <- do.call(rbind, lapply(1:nrow(sample_area), function(x) {
+  inmask <- mask(inlyrs, sample_area[x, ])
+  clhs_sample <- clhs(inmask, size = 12, cost = "cost", simple = FALSE)$sampled_data %>% 
+    st_as_sf()
+})) %>% 
+  st_transform(3153) %>% 
+  st_intersection(sample_area) %>% 
+  select(Name) %>% 
+  group_by(Name) %>% 
+  mutate(Name = paste0("Block ", Name,"_P", 1:n()))
+
+st_write(sample_pts, "AuroraUAV_2024_SamplePts.kml", quiet = TRUE, delete_dsn = TRUE)
+```
