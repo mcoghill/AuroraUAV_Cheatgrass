@@ -92,13 +92,25 @@ m3m_extract <- extract(m3m_covs, fd, bind = TRUE) %>%
   na.omit(field = "")
 
 altum_extract <- altum_extract[!altum_extract$ID %in% m3m_extract$ID, ]
+altum_extract$camera <- "Altum"
+m3m_extract$camera <- "M3M"
 cov_extract <- rbind(altum_extract, m3m_extract) %>% 
   st_as_sf() %>% 
-  select(-ID)
+  select(-ID) %>% 
+  relocate(camera)
 
-var_rm <- apply(st_drop_geometry(cov_extract[, -c(1:3)]), 2, sd) > 0
+var_rm <- apply(st_drop_geometry(cov_extract[, -c(1:4)]), 2, sd) > 0
 
-cov_extract <- select(cov_extract, c(1:3, names(which(var_rm == TRUE))))
+cov_extract <- select(cov_extract, c(1:4, names(which(var_rm == TRUE))))# %>% 
+  # group_by(camera) %>% 
+  # mutate(across(starts_with("MS"), ~ decostand(.x, "standardize")[, 1]))
+altum_extract <- cov_extract %>% 
+  filter(camera == "Altum") %>% 
+  select(-camera)
+
+m3m_extract <- cov_extract %>% 
+  filter(camera == "M3M") %>% 
+  select(-camera)
 
 ```
 
@@ -108,12 +120,12 @@ Scale/center and then correlation analysis
 
 tsk_pres <- as_task_classif_st(
   cov_extract, target = "presence", positive = "TRUE")
-tsk_pres$select(grep("cover|cover_class", tsk_pres$feature_names, 
+tsk_pres$select(grep("camera|cover|cover_class", tsk_pres$feature_names, 
                      invert = TRUE, value = TRUE))
 
 tsk_pres_ng <- as_task_classif(
   st_drop_geometry(cov_extract), target = "presence", positive = "TRUE")
-tsk_pres_ng$select(grep("cover|cover_class", tsk_pres_ng$feature_names, 
+tsk_pres_ng$select(grep("camera|cover|cover_class", tsk_pres_ng$feature_names, 
                      invert = TRUE, value = TRUE))
 
 
@@ -271,13 +283,9 @@ Cover model
 
 ```{r}
 
-tsk_cover <- as_task_regr_st(cov_extract %>% mutate(cover = cover/100), target = "cover")
-tsk_cover$select(grep("presence|cover_class", tsk_cover$feature_names, 
-                     invert = TRUE, value = TRUE))
-
-tsk_cover_ng <- as_task_regr(
-  st_drop_geometry(cov_extract), target = "cover")
-tsk_cover_ng$select(grep("presence|cover_class", tsk_cover_ng$feature_names, 
+cov_dat <- altum_extract
+tsk_cover <- as_task_regr_st(cov_dat, target = "cover")
+tsk_cover$select(grep("camera|presence|cover_class|MS_", tsk_cover$feature_names, 
                      invert = TRUE, value = TRUE))
 
 # Regression correlation filter
@@ -326,7 +334,7 @@ cover_graph = as_learner(cover_po_filter %>>% cover_po_lrn)
 # values (yay!)
 cover_design <- expand.grid(importance.filter.nfeat = (tsk_cover$ncol - 1):4,
                             regr.ranger.num.trees = c(500, 1000, 2000),
-                            regr.ranger.mtry = (tsk_cover$ncol - 1):1) %>% 
+                            regr.ranger.mtry = c(2, 6, 13, 27, 54, 108)) %>% 
   dplyr::filter(regr.ranger.mtry <= importance.filter.nfeat)
 
 cover_tn <- tnr("design_points", design = as.data.table(cover_design))
@@ -345,18 +353,18 @@ plan(list(
   tweak(multisession, workers = availableCores() %/% 4),
   tweak(multisession, workers = I(4))    # <= force 4 workers
 ))
-cover_rr <- mlr3::resample(tsk_cover, cover_at, rsmp("spcv_coords", folds = 8), store_models = TRUE)
+m3m_cover_rr <- mlr3::resample(tsk_cover, cover_at, rsmp("spcv_coords", folds = 8), store_models = TRUE)
 plan(sequential)
 
 # Get the best model for prediction: first, get all outer learners. These would
 # have the most data used for training and testing and will produce the most
 # reliable results
-cover_data = as.data.table(cover_rr)
+cover_data = as.data.table(m3m_cover_rr)
 cover_outer_learners = lapply(cover_data$learner, "[[", "learner")
 
 # From the same object, extract the table of tuning results which can be viewed
 # and queried
-cover_outer_results = as.data.table(cover_rr$score(msr("regr.mse")))
+cover_outer_results = as.data.table(m3m_cover_rr$score(msr("regr.mse")))
 
 # Now, from the outer learners, extract the one with the lowest binary Brier
 # score. Note that if the data is imbalanced, we should probably evaluate 
@@ -369,7 +377,7 @@ cover_best_param_set <- cover_best_learner$param_set
 
 # If interested in the aggregated results of the inner tuning, or interested in
 # looking at the results of each model run, you can use this code here to do so
-# archives = extract_inner_tuning_archives(cover_rr)
+# archives = extract_inner_tuning_archives(m3m_cover_rr)
 # inner_learners = mlr3misc::map(archives$resample_result, "learners")
 
 # using the best learner, generate a map prediction from the predictor rasters
@@ -378,18 +386,129 @@ cover_best_learner$param_set$values$regr.ranger.num.threads <- availableCores()
 # altum_predict = predict_spatial(altum_prob_covs, cover_best_learner, predict_type = "prob")
 # m3m_predict = predict_spatial(m3m_prob_covs, cover_best_learner, predict_type = "prob")
 
-cover_ranger_model <- cover_best_learner$model$regr.ranger$model
+altum_cover_ranger_model <- cover_best_learner$model$regr.ranger$model
 fun <- function(model, ...) predict(model, ...)$predictions
-altum_cover_covs <- altum_covs[[cover_best_learner$model$importance$outtasklayout$id]]
-m3m_cover_covs <- m3m_covs[[cover_best_learner$model$importance$outtasklayout$id]]
+altum_cover_covs <- altum_covs[[cover_best_learner$model$importance$features]]
 altum_cover_predict <- terra::predict(
-  altum_cover_covs, cover_ranger_model, fun = fun, na.rm = TRUE,
-  filename = "C:/Users/mcoghill/SynologyDrive/Cheatgrass/Model Outputs/Altum_update_cover.tif",
+  altum_cover_covs, altum_cover_ranger_model, fun = fun, na.rm = TRUE,
+  filename = "C:/Users/mcoghill/SynologyDrive/Cheatgrass/Model Outputs/Altum_update_cover2.tif",
   overwrite = TRUE)
+
+```
+
+```{r}
+
+cov_dat <- m3m_extract
+tsk_cover <- as_task_regr_st(cov_dat, target = "cover")
+tsk_cover$select(grep("camera|presence|cover_class|MS_", tsk_cover$feature_names, 
+                     invert = TRUE, value = TRUE))
+
+# Regression correlation filter
+# cor_flt = flt("correlation")
+# cor_flt$calculate(tsk_cover_ng)
+# cor_dt <- as.data.table(cor_flt)
+# cor_dt <- cor_dt[score >= 0.1, ]$feature
+# tsk_cover$select(cor_dt)
+
+
+# Create the learner for feature filtering
+cover_lrn_filter = lrn("regr.ranger", importance = "impurity", 
+                       predict_type = "response",
+                       num.trees = to_tune(500, 500))
+
+# Create the "auto-tuner" for feature filtering (only used to simplify resampling)
+cover_at_filter <- auto_tuner(
+  tuner = tnr("grid_search"),
+  learner = cover_lrn_filter,
+  terminator = trm("none"),
+  measure = msr("oob_error"),
+  resampling = rsmp("loo"), # leave one out resampling, should find most accurate feature importance
+  store_models = TRUE
+)
+
+# Train the auto tuned model so that we get the best order of features to be
+# used downstream
+cover_at_filter$train(tsk_cover)
+
+# Place the best resulting learner into a filtering pipeop
+cover_po_filter = po("filter", filter = flt("importance", learner = cover_at_filter$learner),
+                     filter.nfeat = to_tune(1, tsk_cover$ncol - 1))
+
+# Next, create a learner pipeop that will tune the hyperparameters
+cover_lrn_tune = lrn("regr.ranger", importance = "impurity", 
+                predict_type = "response",
+                num.trees = to_tune(100, 2000),
+                mtry = to_tune(1, tsk_cover$ncol - 1))
+
+cover_po_lrn = po("learner", cover_lrn_tune)
+
+# Create the graph learner object that will combine these
+cover_graph = as_learner(cover_po_filter %>>% cover_po_lrn)
+
+# Create the tuning design grid - I figured out how to tune across all mtry
+# values (yay!)
+cover_design <- expand.grid(importance.filter.nfeat = (tsk_cover$ncol - 1):4,
+                            regr.ranger.num.trees = c(500, 1000, 2000),
+                            regr.ranger.mtry = c(2, 6, 13, 27, 54, 108)) %>% 
+  dplyr::filter(regr.ranger.mtry <= importance.filter.nfeat)
+
+cover_tn <- tnr("design_points", design = as.data.table(cover_design))
+
+# Create the auto-tuner object
+cover_at <- auto_tuner(
+  tuner = cover_tn,
+  learner = cover_graph,
+  resampling = rsmp("cv", folds = 4),
+  measure = msr("regr.rsq"),
+  terminator = trm("none")
+)
+
+# Runs both outer and inner loops in parallel
+plan(list(
+  tweak(multisession, workers = availableCores() %/% 4),
+  tweak(multisession, workers = I(4))    # <= force 4 workers
+))
+m3m_cover_rr <- mlr3::resample(tsk_cover, cover_at, rsmp("spcv_coords", folds = 8), store_models = TRUE)
+plan(sequential)
+
+# Get the best model for prediction: first, get all outer learners. These would
+# have the most data used for training and testing and will produce the most
+# reliable results
+cover_data = as.data.table(m3m_cover_rr)
+cover_outer_learners = lapply(cover_data$learner, "[[", "learner")
+
+# From the same object, extract the table of tuning results which can be viewed
+# and queried
+cover_outer_results = as.data.table(m3m_cover_rr$score(msr("regr.rsq")))
+
+# Now, from the outer learners, extract the one with the lowest binary Brier
+# score. Note that if the data is imbalanced, we should probably evaluate 
+# models using the area under the precision recall ROC curve (classif.prauc)
+# according to the documentation
+cover_best_id <- which.max(cover_outer_results$regr.rsq)
+cover_best_learner <- cover_outer_learners[[cover_best_id]]
+cover_best_tune <- cover_data$learner[[cover_best_id]]$tuning_result[, 1:3]
+cover_best_param_set <- cover_best_learner$param_set
+
+# If interested in the aggregated results of the inner tuning, or interested in
+# looking at the results of each model run, you can use this code here to do so
+# archives = extract_inner_tuning_archives(m3m_cover_rr)
+# inner_learners = mlr3misc::map(archives$resample_result, "learners")
+
+# using the best learner, generate a map prediction from the predictor rasters
+# Set the num.threads value to use all cores
+cover_best_learner$param_set$values$regr.ranger.num.threads <- availableCores()
+# altum_predict = predict_spatial(altum_prob_covs, cover_best_learner, predict_type = "prob")
+# m3m_predict = predict_spatial(m3m_prob_covs, cover_best_learner, predict_type = "prob")
+
+m3m_cover_ranger_model <- cover_best_learner$model$regr.ranger$model
+fun <- function(model, ...) predict(model, ...)$predictions
+m3m_cover_covs <- m3m_covs[[cover_best_learner$model$importance$features]]
 m3m_cover_predict <- terra::predict(
-  m3m_cover_covs, cover_ranger_model, fun = fun, na.rm = TRUE,
-  filename = "C:/Users/mcoghill/SynologyDrive/Cheatgrass/Model Outputs/M3M_update_cover.tif",
+  m3m_cover_covs, m3m_cover_ranger_model, fun = fun, na.rm = TRUE,
+  filename = "C:/Users/mcoghill/SynologyDrive/Cheatgrass/Model Outputs/M3M_update_cover2.tif",
   overwrite = TRUE)
+
 
 cover_predict_merge <- mosaic(
   altum_cover_predict, m3m_cover_predict, fun = "mean",
@@ -413,6 +532,370 @@ levels(cover_classes) <- cls[, 1:2]
 coltab(cover_classes) <- cls[, c(1, 3)]
 cover_classes <- writeRaster(
   cover_classes,
-  "C:/Users/mcoghill/SynologyDrive/Cheatgrass/Model Outputs/Kamloops_Lake_Cover_Class.tif",
+  "C:/Users/mcoghill/SynologyDrive/Cheatgrass/Model Outputs/Kamloops_Lake_Cover_Class2.tif",
   overwrite = TRUE)
+```
+
+Resorting to using the old models feature set:
+
+```{r}
+
+cov_dat <- cov_extract
+# cov_dat_nz <- select(altum_extract, -c(presence, cover)) %>%
+#   select(c("cover_class", "Terrain_o_flow_horiz", "Terrain_insolation_direct",
+#            "Terrain_mrvbf",
+#            "Normal_1991_2020S_Eref_sm", "Terrain_openness_neg",
+#            "Terrain_openness_pos", "Terrain_o_flow", "Terrain_tri",
+#            "Terrain_twi", "Terrain_vert_dist_cn", "Terrain_o_flow_vert")) %>%
+#   st_drop_geometry()# %>% 
+  # mutate(cover_class = as.character(cover_class))
+
+# cov_dat <- cov_dat %>%
+#   mutate(weights = ifelse(cover_class == "Free (0%)", 1, 2))
+
+tsk_cover <- as_task_classif_st(cov_dat, target = "cover_class")
+# tsk_cover$set_col_roles("weights", roles = "weight")
+tsk_cover$select(grep("camera|presence|cover", tsk_cover$feature_names, 
+                     invert = TRUE, value = TRUE))
+tsk_cover$select(c("Terrain_o_flow_horiz", "Terrain_insolation_direct", "Terrain_mrvbf",
+                   "Normal_1991_2020S_Eref_sm", "Terrain_openness_neg",
+                   "Terrain_openness_pos", "Terrain_o_flow", "Terrain_tri",
+                   "Terrain_twi", "Terrain_vert_dist_cn", "Terrain_o_flow_vert"))
+
+gr_smote =
+  po("colapply", id = "int_to_num",
+    applicator = as.numeric, affect_columns = selector_type("integer")) %>>%
+  po("smote", id = "smote1", dup_size = 5) %>>%
+  po("smote", id = "smote2", dup_size = 5) %>>%
+  po("smote", id = "smote3", dup_size = 3) %>>%
+  po("smote", id = "smote4", dup_size = 3) %>>%
+  po("classbalancing", id = "classbalance", ratio = 0.5, reference = "major",
+     adjust = "major", shuffle = TRUE) %>>%
+  po("colapply", id = "num_to_int",
+    applicator = function(x) as.integer(round(x, 0L)), affect_columns = selector_name("Normal_1991_2020S_Eref_sm"))
+
+tsk_cover <- gr_smote$train(tsk_cover)[[1L]]
+
+# opb <- po("classbalancing")
+# opb$param_set$values = list(ratio = 1/3, reference = "major",
+#   adjust = "nonmajor", shuffle = FALSE)
+# tsk_cover = opb$train(list(tsk_cover))[[1L]]
+# opb <- po("classbalancing")
+# opb$param_set$values = list(ratio = 0.5, reference = "major",
+#   adjust = "major", shuffle = FALSE)
+# tsk_cover = opb$train(list(tsk_cover))[[1L]]
+
+cover_lrn_tune = lrn("classif.ranger", importance = "impurity", 
+                predict_type = "response",
+                num.trees = 500,
+                mtry = 5)
+
+cover_rr_loo <- mlr3::resample(tsk_cover, cover_lrn_tune, rsmp("repeated_cv", folds = 4, repeats = 8), store_models = TRUE)
+
+# cover_design <- expand.grid(num.trees = c(500, 1000, 2000),
+#                             mtry = 11:1)
+# 
+# cover_tn <- tnr("design_points", design = as.data.table(cover_design))
+# 
+# # Create the "auto-tuner" for feature filtering (only used to simplify resampling)
+# cover_at_filter <- auto_tuner(
+#   tuner = cover_tn,
+#   learner = cover_lrn_tune,
+#   terminator = trm("none"),
+#   measure = msr("oob_error"),
+#   resampling = rsmp("loo"), # leave one out resampling, should find most accurate feature importance
+#   store_models = TRUE
+# )
+# 
+# cover_at_filter$train(tsk_cover)
+
+# Get the best model for prediction: first, get all outer learners. These would
+# have the most data used for training and testing and will produce the most
+# reliable results
+cover_data = as.data.table(cover_rr_loo)
+cover_outer_learners = cover_data$learner
+
+# From the same object, extract the table of tuning results which can be viewed
+# and queried
+cover_outer_results = as.data.table(cover_rr_loo$score(msr("oob_error")))
+
+# Now, from the outer learners, extract the one with the lowest binary Brier
+# score. Note that if the data is imbalanced, we should probably evaluate 
+# models using the area under the precision recall ROC curve (classif.prauc)
+# according to the documentation
+cover_best_id <- which.min(cover_outer_results$oob_error)
+cover_best_learner <- cover_outer_learners[[cover_best_id]]
+cover_best_param_set <- cover_best_learner$param_set
+
+# If interested in the aggregated results of the inner tuning, or interested in
+# looking at the results of each model run, you can use this code here to do so
+# archives = extract_inner_tuning_archives(m3m_cover_rr)
+# inner_learners = mlr3misc::map(archives$resample_result, "learners")
+
+# using the best learner, generate a map prediction from the predictor rasters
+# Set the num.threads value to use all cores
+cover_best_learner$param_set$values$num.threads <- availableCores()
+# altum_predict = predict_spatial(altum_prob_covs, cover_best_learner, predict_type = "prob")
+# m3m_predict = predict_spatial(m3m_prob_covs, cover_best_learner, predict_type = "prob")
+
+cover_ranger_model <- cover_best_learner$model
+fun <- function(model, ...) predict(model, ...)$predictions
+altum_cover_covs <- altum_covs[[names(cover_best_learner$model$variable.importance)]]
+m3m_cover_covs <- m3m_covs[[names(cover_best_learner$model$variable.importance)]]
+altum_cover_predict <- terra::predict(
+  altum_cover_covs, cover_ranger_model, fun = fun, na.rm = TRUE,
+  filename = "C:/Users/mcoghill/SynologyDrive/Cheatgrass/Model Outputs/Altum_update_cover2.tif",
+  overwrite = TRUE)
+m3m_cover_predict <- terra::predict(
+  m3m_cover_covs, cover_ranger_model, fun = fun, na.rm = TRUE,
+  filename = "C:/Users/mcoghill/SynologyDrive/Cheatgrass/Model Outputs/M3M_update_cover2.tif",
+  overwrite = TRUE)
+
+# Check for data type here (integer vs. numeric)
+cc_predict_merge <- mosaic(
+  altum_cover_predict, m3m_cover_predict, fun = "modal")
+
+cls <- data.frame(
+  id = 1:5,
+  class = c("Free (0%)", "Trace (1-5%)", "Light Infestation (5-25%)",
+            "Mild Infestation (25-50%)", "Cheatgrass Dominated (50-100%)"),
+  col = c("green", "deepskyblue", "yellow", "orange", "red"))
+
+levels(cc_predict_merge) <- cls[, 1:2]
+coltab(cc_predict_merge) <- cls[, c(1, 3)]
+cc_predict_merge <- writeRaster(
+  cc_predict_merge,
+  "C:/Users/mcoghill/SynologyDrive/Cheatgrass/Model Outputs/Kamloops_Lake_cover_class4_color.tif",
+  overwrite = TRUE)
+
+#################
+
+cov_dat <- m3m_extract
+tsk_cover <- as_task_regr_st(cov_dat, target = "cover")
+tsk_cover$select(grep("camera|presence|cover_class", tsk_cover$feature_names, 
+                     invert = TRUE, value = TRUE))
+tsk_cover$select(c("Terrain_openness_neg",
+                   "Terrain_o_flow", "Terrain_tri",
+                   "Terrain_vert_dist_cn", "Terrain_o_flow_vert"))
+
+
+cover_lrn_tune = lrn("regr.ranger", importance = "impurity", 
+                predict_type = "response",
+                num.trees = 2000,
+                mtry = 1)
+
+cover_rr_loo <- mlr3::resample(tsk_cover, cover_lrn_tune, rsmp("repeated_spcv_coords", folds = 10), store_models = TRUE)
+
+# cover_design <- expand.grid(num.trees = c(500, 1000, 2000),
+#                             mtry = 11:1)
+# 
+# cover_tn <- tnr("design_points", design = as.data.table(cover_design))
+# 
+# # Create the "auto-tuner" for feature filtering (only used to simplify resampling)
+# cover_at_filter <- auto_tuner(
+#   tuner = cover_tn,
+#   learner = cover_lrn_tune,
+#   terminator = trm("none"),
+#   measure = msr("oob_error"),
+#   resampling = rsmp("loo"), # leave one out resampling, should find most accurate feature importance
+#   store_models = TRUE
+# )
+# 
+# cover_at_filter$train(tsk_cover)
+
+# Get the best model for prediction: first, get all outer learners. These would
+# have the most data used for training and testing and will produce the most
+# reliable results
+cover_data = as.data.table(cover_rr_loo)
+cover_outer_learners = cover_data$learner
+
+# From the same object, extract the table of tuning results which can be viewed
+# and queried
+cover_outer_results = as.data.table(cover_rr_loo$score(msr("oob_error")))
+
+# Now, from the outer learners, extract the one with the lowest binary Brier
+# score. Note that if the data is imbalanced, we should probably evaluate 
+# models using the area under the precision recall ROC curve (classif.prauc)
+# according to the documentation
+cover_best_id <- which.min(cover_outer_results$oob_error)
+cover_best_learner <- cover_outer_learners[[cover_best_id]]
+cover_best_param_set <- cover_best_learner$param_set
+
+# If interested in the aggregated results of the inner tuning, or interested in
+# looking at the results of each model run, you can use this code here to do so
+# archives = extract_inner_tuning_archives(m3m_cover_rr)
+# inner_learners = mlr3misc::map(archives$resample_result, "learners")
+
+# using the best learner, generate a map prediction from the predictor rasters
+# Set the num.threads value to use all cores
+cover_best_learner$param_set$values$num.threads <- availableCores()
+# altum_predict = predict_spatial(altum_prob_covs, cover_best_learner, predict_type = "prob")
+# m3m_predict = predict_spatial(m3m_prob_covs, cover_best_learner, predict_type = "prob")
+
+m3m_cover_ranger_model <- cover_best_learner$model
+fun <- function(model, ...) predict(model, ...)$predictions
+m3m_cover_covs <- m3m_covs[[names(cover_best_learner$model$variable.importance)]]
+m3m_cover_predict <- terra::predict(
+  m3m_cover_covs, m3m_cover_ranger_model, fun = fun, na.rm = TRUE,
+  filename = "C:/Users/mcoghill/SynologyDrive/Cheatgrass/Model Outputs/M3M_update_cover2.tif",
+  overwrite = TRUE)
+
+
+
+
+```
+
+Cover Classes
+
+```{r}
+
+tsk_cc <- as_task_classif_st(
+  cov_extract, target = "cover_class")
+tsk_cc$select(grep("camera|cover|presence", tsk_cc$feature_names, 
+                     invert = TRUE, value = TRUE))
+
+tsk_cc_ng <- as_task_classif(
+  st_drop_geometry(cov_extract), target = "cover_class")
+tsk_cc_ng$select(grep("camera|cover|presence", tsk_cc_ng$feature_names, 
+                     invert = TRUE, value = TRUE))
+
+
+# poin <- list(tsk_pres$clone())
+# po_scale <- po("scale")
+# poout <- po_scale$train(poin)
+# poout <- po_scale$predict(poin)[[1]]
+
+# Classification correlation filter (finds features that are correlated with 
+# the presence data, i.e.: more explanatory variables)
+# cor_fflt = flt("find_correlation")
+# cor_fflt$calculate(tsk_pres_ng)
+# cor_fdt <- as.data.table(cor_fflt)
+# cor_fdt <- cor_fdt[score >= 0.1, ]$feature
+# tsk_pres$select(cor_fdt)
+# altum_prob_covs <- altum_covs[[cor_fdt]]
+# m3m_prob_covs <- m3m_covs[[cor_fdt]]
+
+# Create the learner for feature filtering
+cc_lrn_filter = lrn("classif.ranger", importance = "impurity", 
+                 predict_type = "response",
+                 num.trees = to_tune(500, 500))
+
+# Create the "auto-tuner" for feature filtering (only used to simplify resampling)
+cc_at_filter <- auto_tuner(
+  tuner = tnr("grid_search"),
+  learner = cc_lrn_filter,
+  terminator = trm("none"),
+  measure = msr("oob_error"),
+  resampling = rsmp("loo"), # leave one out resampling, should find most accurate feature importance
+  store_models = TRUE
+)
+
+# Train the auto tuned model so that we get the best order of features to be
+# used downstream
+cc_at_filter$train(tsk_cc)
+
+# Place the best resulting learner into a filtering pipeop
+cc_po_filter = po("filter", filter = flt("importance", learner = cc_at_filter$learner),
+               filter.nfeat = to_tune(1, tsk_cc$ncol - 1))
+
+# Next, create a learner pipeop that will tune the hyperparameters
+cc_lrn_tune = lrn("classif.ranger", importance = "impurity", 
+                predict_type = "response",
+                num.trees = to_tune(100, 2000),
+                mtry = to_tune(1, tsk_cc$ncol - 1))
+
+cc_po_lrn = po("learner", cc_lrn_tune)
+
+# Create the graph learner object that will combine these
+cc_graph = as_learner(cc_po_filter %>>% cc_po_lrn)
+
+# Create the tuning design grid - I figured out how to tune across all mtry
+# values (yay!)
+cc_design <- expand.grid(importance.filter.nfeat = (tsk_cc$ncol - 1):4,
+                      classif.ranger.num.trees = c(500, 1000, 2000),
+                      classif.ranger.mtry = (tsk_cc$ncol - 1):1) %>% 
+  dplyr::filter(classif.ranger.mtry <= importance.filter.nfeat)
+
+cc_tn <- tnr("design_points", design = as.data.table(cc_design))
+
+# Create the auto-tuner object
+cc_at <- auto_tuner(
+  tuner = cc_tn,
+  learner = cc_graph,
+  resampling = rsmp("cv", folds = 4),
+  measure = msr("classif.ce"),
+  terminator = trm("none")
+)
+
+# Runs both outer and inner loops in parallel
+plan(list(
+  tweak(multisession, workers = availableCores() %/% 4),
+  tweak(multisession, workers = I(4))    # <= force 4 workers
+))
+cc_rr <- mlr3::resample(tsk_cc, cc_at, rsmp("spcv_coords", folds = 8), store_models = TRUE)
+plan(sequential)
+
+# Get the best model for prediction: first, get all outer learners. These would
+# have the most data used for training and testing and will produce the most
+# reliable results
+cc_data = as.data.table(cc_rr)
+cc_outer_learners = lapply(cc_data$learner, "[[", "learner")
+
+# From the same object, extract the table of tuning results which can be viewed
+# and queried
+cc_outer_results = as.data.table(cc_rr$score(msr("classif.ce")))
+
+# Now, from the outer learners, extract the one with the lowest binary Brier
+# score. Note that if the data is imbalanced, we should probably evaluate 
+# models using the area under the precision recall ROC curve (classif.prauc)
+# according to the documentation
+cc_best_id <- which.min(cc_outer_results$classif.ce)
+cc_best_learner <- cc_outer_learners[[cc_best_id]]
+cc_best_tune <- cc_data$learner[[cc_best_id]]$tuning_result[, 1:3]
+cc_best_param_set <- cc_best_learner$param_set
+
+# If interested in the aggregated results of the inner tuning, or interested in
+# looking at the results of each model run, you can use this code here to do so
+# archives = extract_inner_tuning_archives(rr)
+# inner_learners = mlr3misc::map(archives$resample_result, "learners")
+
+# using the best learner, generate a map prediction from the predictor rasters
+# Set the num.threads value to use all cores
+cc_best_learner$param_set$values$classif.ranger.num.threads <- availableCores()
+# altum_predict = predict_spatial(altum_prob_covs, best_learner, predict_type = "prob")
+# m3m_predict = predict_spatial(m3m_prob_covs, best_learner, predict_type = "prob")
+
+cc_ranger_model <- cc_best_learner$model$classif.ranger$model
+fun <- function(model, ...) predict(model, ...)$predictions
+cc_altum_prob_covs <- altum_covs[[cc_best_learner$model$importance$outtasklayout$id]]
+cc_m3m_prob_covs <- m3m_covs[[cc_best_learner$model$importance$outtasklayout$id]]
+cc_altum_predict <- terra::predict(
+  cc_altum_prob_covs, cc_ranger_model, fun = fun, na.rm = TRUE,
+  filename = "C:/Users/mcoghill/SynologyDrive/Cheatgrass/Model Outputs/Altum_update_cover_class.tif",
+  overwrite = TRUE)
+cc_m3m_predict <- terra::predict(
+  cc_m3m_prob_covs, cc_ranger_model, fun = fun, na.rm = TRUE,
+  filename = "C:/Users/mcoghill/SynologyDrive/Cheatgrass/Model Outputs/M3M_update_cover_class.tif",
+  overwrite = TRUE)
+
+# Check for data type here (integer vs. numeric)
+cc_predict_merge <- mosaic(
+  cc_altum_predict, cc_m3m_predict, fun = "modal",
+  filename = "C:/Users/mcoghill/SynologyDrive/Cheatgrass/Model Outputs/Kamloops_Lake_cover_class3.tif",
+  overwrite = TRUE)
+
+
+cls <- data.frame(
+  id = 1:5,
+  class = c("Free (0%)", "Trace (1-5%)", "Light Infestation (5-25%)",
+            "Mild Infestation (25-50%)", "Cheatgrass Dominated (50-100%)"),
+  col = c("green", "deepskyblue", "yellow", "orange", "red"))
+
+levels(cc_predict_merge) <- cls[, 1:2]
+coltab(cc_predict_merge) <- cls[, c(1, 3)]
+cc_predict_merge <- writeRaster(
+  cc_predict_merge,
+  "C:/Users/mcoghill/SynologyDrive/Cheatgrass/Model Outputs/Kamloops_Lake_Prob_Class.tif",
+  overwrite = TRUE)
+
 ```
