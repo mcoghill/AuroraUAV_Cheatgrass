@@ -9,6 +9,8 @@ ls <- c("tidyverse", "lidR", "sf", "sfheaders", "future.apply", "terra",
 
 new_packages <- ls[!(ls %in% installed.packages()[, "Package"])]
 if(length(new_packages)) install.packages(new_packages)
+if("lasR"[!"lasR" %in% installed.packages()[, "Package"]])
+  install.packages("lasR", repos = "https://r-lidar.r-universe.dev")
 
 # ClimateNAr package
 # First, check if ClimateNAr is already installed and up to date.
@@ -35,7 +37,10 @@ if(i) {
 # devtools::install_github("mcoghill/lidR.li2012enhancement")
 
 # SAGA GIS - Choose version (check at https://sourceforge.net/projects/saga-gis/)
-saga_ver <- "9.6.0"
+# A note on versions: There is a bug from version 9.5.1 on that prevents the 
+# "Basic Terrain Analysis" tool to proceed. I have notified the SAGA GIS team
+# of this issue, hopefully it will be fixed in future versions.
+saga_ver <- "9.5.0"
 url <- paste0("https://sourceforge.net/projects/saga-gis/files/SAGA%20-%20",
               strsplit(saga_ver, "\\.")[[1]][1], "/SAGA%20-%20",
               saga_ver, "/saga-", saga_ver, "_x64.zip/")
@@ -45,3 +50,9 @@ saga_zip <- file.path(saga_dir, paste0("saga-", saga_ver, "_x64.zip"))
 download.file(url, saga_zip, mode = "wb") # mode argument only needed on Windows
 unzip(saga_zip, exdir = saga_dir)
 unlink(saga_zip)
+
+# A custom toolchain has been provided for some terrain layers. Copy this XML
+# file to the SAGA toolchain folder to allow it to be recognized in Rsagacmd:
+xml_file <- list.files("helpers", pattern = ".xml$", full.names = TRUE)
+saga_tc <- file.path(saga_dir, paste0("saga-", saga_ver, "_x64"), "tools/toolchains")
+file.copy(xml_file, saga_tc, overwrite = TRUE)
