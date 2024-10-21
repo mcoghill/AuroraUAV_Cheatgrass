@@ -1,5 +1,6 @@
 ---
 title: "ST_02_LAS Processing"
+author: "Matthew Coghill"
 format: html
 editor: visual
 ---
@@ -12,12 +13,10 @@ First, load packages.
 
 ```{r setup, include=FALSE}
 
-knitr::opts_chunk$set(echo = TRUE, results = "hide")
-
 ls <- c("tidyverse", "terra", "sf", "lidR", "lasR", "Rsagacmd", "ClimateNAr",
         "RStoolbox", "future.apply")
-invisible(
-  suppressPackageStartupMessages(lapply(ls, library, character.only = TRUE)))
+invisible(suppressPackageStartupMessages(
+  lapply(ls, library, character.only = TRUE)))
 rm(ls)
 
 # Here, I set some memory options that allow for larger files to be stored in
@@ -41,7 +40,7 @@ serv_conn <- "SynologyDrive"
 
 The files that we will be working with are located on the remote server. File access may be granted by contacting info\@aurorauav.com
 
-```{r Directories}
+```{r Directories, include=FALSE}
 
 if(serv_conn == "SFTP") {
   user <- "mcoghill"
@@ -54,15 +53,15 @@ if(serv_conn == "SFTP") {
 proj <- "South Thompson"
 proc_dir <- file.path(serv, "Processed Imagery", proj)
 layr_dir <- file.path(serv, "Modelling/Layers", proj)
-tile_dir <- file.path(layr_dir, "01_LAS")
-dtm_dir <- file.path(layr_dir, "02_DTM")
-clm_dir <- file.path(layr_dir, "03_Climate")
-ms_dir <- file.path(layr_dir, "04_Multispectral")
-cov_dir <- file.path(layr_dir, "05_Covariates")
+tile_dir <- file.path(tempdir(), "01_LAS")
+dtm_dir <- file.path(tempdir(), "02_DTM")
+clm_dir <- file.path(tempdir(), "03_Climate")
+ms_dir <- file.path(tempdir(), "04_Multispectral")
+# cov_dir <- file.path(layr_dir, "05_Covariates")
 if(dir.exists(layr_dir) && sanitize) unlink(layr_dir, recursive = TRUE)
 dir.create(layr_dir, showWarnings = FALSE)
 invisible(
-  sapply(c(tile_dir, dtm_dir, clm_dir, cov_dir, ms_dir),
+  sapply(c(tile_dir, dtm_dir, clm_dir, ms_dir),
          dir.create, showWarnings = FALSE))
 
 # Each folder with a KMZ file will be used to process LAS files (i.e.: all RGB 
@@ -95,7 +94,7 @@ LAS tile processing. First, split large LAS files into several smaller tiles (ac
 
 For the `lasR` package functions: this package flows inputs and outputs in a series of functions called a "pipeline". At any stage in the pipeline you can decide to output files if needed. We don't need to worry about buffering LAS tiles here either, that is all taken care of in the background without the need for (or ability to provide) input.
 
-```{r LAS_processing}
+```{r LAS_processing, include=FALSE}
 
 set_lidr_threads(0)
 las_proc <- lapply(rgb_las_files, function(x) {
@@ -155,11 +154,11 @@ rm(raw_dtms, tile_dir)
 
 Mosiac DTM's and CHM's using SAGA GIS's mosaic function. This function does not output the mosaicked file with a proper CRS, so it needs to be brought back into R and reassigned.
 
-```{r DTM_Mosaic}
+```{r DTM_Mosaic, include=FALSE}
 
 # Define input file lists, and then mosaic
 dtm_chm_list <- do.call(c, lapply(las_proc, sources))
-dtm_chm_mos <- lapply(c("DTM", "CHM"), function(x) {
+dtm_chm_mos <- do.call(c, lapply(c("DTM", "CHM"), function(x) {
   
   # Write a list of tif files in a text file to be read by SAGA GIS for mosaicking
   file_list <- grep(paste0("_", x, ".tif$"), dtm_chm_list, value = TRUE)
@@ -175,13 +174,10 @@ dtm_chm_mos <- lapply(c("DTM", "CHM"), function(x) {
   # Fix the CRS information
   terra::crs(rast_mosaic) <- terra::crs(las_proc[[1]])
   rast_mosaic <- writeRaster(rast_mosaic, file.path(
-    cov_dir, paste0(x, ".tif")), overwrite = TRUE)
+    layr_dir, paste0(x, ".tif")), overwrite = TRUE)
   unlink(file.path(tempdir(), paste0(x, ".tif")))
   return(rast_mosaic)
-})
-
-dtm_mosaic <- dtm_chm_mos[[1]]
-chm_mosaic <- dtm_chm_mos[[2]]
+}))
 
 ```
 
@@ -191,7 +187,7 @@ Start with ClimateBC/ClimateNAr processing. As of later 2024, a new ClimateNAr p
 
 It is quicker and more memory efficient to generate climate layers by flight area, and then mosaic each climate layer together at the end rather than trying to generate the climate layers for the entire area in a single function. For this, we rely on the original DTM's before they were mosaicked.
 
-```{r Climate_attributes}
+```{r Climate_attributes, include=FALSE}
 
 # Get the input list of DTM's, then define the period list of periods from which
 # climate data will be generated, and a variable list for which variables to
@@ -310,7 +306,7 @@ clm_mosaics <- do.call(c, lapply(names(clm_par[[1]]), function(x) {
   # Assign CRS information, and write file to covariate directory
   terra::crs(clm_mosaic) <- terra::crs(clm_var[[1]])
   clm_mosaic <- writeRaster(
-    clm_mosaic, file.path(cov_dir, paste0(x, ".tif")), overwrite = TRUE)
+    clm_mosaic, file.path(layr_dir, paste0(x, ".tif")), overwrite = TRUE)
   
   unlink(file.path(tempdir(), paste0(x, ".tif")))
   return(clm_mosaic)
@@ -324,7 +320,7 @@ rm(clm_dir)
 
 Resample reflectance layers and generate spectral indices
 
-```{r MS_Indices}
+```{r MS_Indices, include=FALSE}
 
 ms_lowres <- lapply(refl_dirs, function(x) {
   
@@ -394,7 +390,7 @@ bands_mos <- do.call(c, lapply(names(ms_lowres[[1]]), function(x) {
 s <- spectralIndices(
   img = bands_mos, blue = "blue", green = "green", red = "red", nir = "nir", 
   redEdge2 = "red edge") %>% 
-  writeRaster(file.path(cov_dir, paste0("MS_", names(.), ".tif")),
+  writeRaster(file.path(layr_dir, paste0("MS_", names(.), ".tif")),
               overwrite = TRUE)
 
 # Cleanup
@@ -405,10 +401,10 @@ rm(dtm_dir, ms_dir)
 
 Finally, create terrain layers from the mosaicked DTM. The variables generated include the ones from the basic terrain analysis, as well as a number of variables which are included in a toolchain provided from an XML file that I wrote.
 
-```{r Terrain_attributes}
+```{r Terrain_attributes, include=FALSE}
 
-dtm <- rast(file.path(cov_dir, "DTM.tif"))
-od <- normalizePath(file.path(cov_dir, "Terrain_"), mustWork = FALSE)
+dtm <- rast(file.path(layr_dir, "DTM.tif"))
+od <- normalizePath(file.path(layr_dir, "Terrain_"), mustWork = FALSE)
 
 # Use a built in toolchain to get some of the terrain layers
 ta_basic <- saga$ta_compound$basic_terrain_analysis(
@@ -432,6 +428,7 @@ ta_basic <- do.call(c, unname(ta_basic))
 dtmp <- sum(dtm, ta_basic[["sinks"]], na.rm = TRUE, 
             filename = file.path(tempdir(), "DTM-preproc.tif"),
             overwrite = TRUE, wopt = list(names = "DTM-preproc"))
+ta_basic <- ta_basic[[-which(names(ta_basic) == "sinks")]]
 
 # Use custom made toolchain to get more terrain layers:
 ta_custom <- saga$ta_morphometry$custom_toolchain(
@@ -450,18 +447,11 @@ ta_custom <- saga$ta_morphometry$custom_toolchain(
 ta_custom <- do.call(c, unname(ta_custom))
 
 # Sanity check for ensuring things line up properly:
-covs <- c(dtm_mosaic, chm_mosaic, clm_mosaics, s, ta_basic, ta_custom)
-
-# Move files
-cov_files <- list.files(cov_dir, full.names = TRUE, pattern = ".tif$")
-file.rename(cov_files, file.path(layr_dir, basename(cov_files)))
-rm(cov_files)
+covs <- c(dtm_chm_mos, clm_mosaics, s, ta_basic, ta_custom)
+covs_files <- rast(list.files(layr_dir, pattern = ".tif", full.names = TRUE))
 
 # Cleanup
 saga_remove_tmpfiles()
-unlink(cov_dir, recursive = TRUE)
-rm(cov_dir)
-
-covs <- rast(list.files(layr_dir, pattern = ".tif", full.names = TRUE))
+unlink(file.path(tempdir(), c("sinks.tif", "DTM-preproc.tif")))
 
 ```
