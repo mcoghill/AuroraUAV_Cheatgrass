@@ -1,0 +1,139 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<toolchain saga-version="9.5.0">
+	<group>ta_morphometry</group>
+	<identifier>twi</identifier>
+	<name>Custom Toolchain</name>
+	<author>M.Coghill (c) 2024</author>
+	<description>
+		Calculates various morphometric and lighting terrain based variables.
+	</description>
+	<menu>Topographic Indices</menu>
+	<parameters>
+	<option varname="GRID_SYSTEM" type="grid_system">
+		<name>Grid System</name>
+	</option>
+	<input varname="DEM" type="grid" parent="GRID_SYSTEM">
+		<name>Elevation</name>
+	</input>
+	<output varname="MRVBF" type="grid" parent="GRID_SYSTEM">
+		<name>Multiresolution Index of Valley Bottom Flatness</name>
+	</output>
+	<output varname="MRRTF" type="grid" parent="GRID_SYSTEM">
+		<name>Multiresolution Index of Ridge Top Flatness</name>
+	</output>
+	<output varname="DAH" type="grid" parent="GRID_SYSTEM">
+		<name>Diurnal Anisotropic Heat</name>
+	</output>
+	<output varname="TPI" type="grid" parent="GRID_SYSTEM">
+		<name>Topographic Position Index</name>
+	</output>
+	<output varname="TRI" type="grid" parent="GRID_SYSTEM">
+		<name>Terrain Ruggedness Index</name>
+	</output>
+	<output varname="POS" type="grid" parent="GRID_SYSTEM">
+		<name>Positive Openness</name>
+	</output>
+	<output varname="NEG" type="grid" parent="GRID_SYSTEM">
+		<name>Negative Openness</name>
+	</output>
+	<output varname="DIRECT" type="grid" parent="GRID_SYSTEM">
+		<name>Direct Insolation</name>
+	</output>
+	<output varname="DIFFUSE" type="grid" parent="GRID_SYSTEM">
+		<name>Diffuse Insolation</name>
+	</output>
+	<option varname="MRVBF_THRESH" type="double">
+		<name>MRVBF - Initial Threshold for Slope</name>
+		<value>179.153539882744</value>
+	</option>
+	<option varname="LOCATION" type="choice">
+      <name>Location</name>
+      <description></description>
+      <value>calculate from grid system</value>
+      <choices>constant latitude|calculate from grid system</choices>
+    </option>
+    <option varname="LATITUDE" type="degree" parent="LOCATION">
+      <name>Latitude</name>
+      <description></description>
+      <value min="-90.000000" max="90.000000">+053°00'00''</value>
+    </option>
+    <option varname="PERIOD" type="choice">
+      <name>Time Period</name>
+      <description></description>
+      <value>range of days</value>
+      <choices>moment|day|range of days</choices>
+    </option>
+    <option varname="DAY" type="date" parent="PERIOD">
+      <name>Day</name>
+      <description></description>
+      <value>2024-07-30</value>
+    </option>
+    <option varname="DAY_STOP" type="date" parent="DAY">
+      <name>Last Day</name>
+      <description></description>
+      <value>2024-10-08</value>
+    </option>
+    <option varname="DAYS_STEP" type="integer" parent="DAY">
+      <name>Resolution [d]</name>
+      <description>Time step size for a range of days calculation given in days.</description>
+      <value min="1.000000">14</value>
+    </option>
+    <option varname="MOMENT" type="double" parent="PERIOD">
+      <name>Moment [h]</name>
+      <description></description>
+      <value min="0.000000" max="24.000000">12</value>
+    </option>
+    <option varname="HOUR_RANGE" type="range" parent="PERIOD">
+      <name>Time Span [h]</name>
+      <description>Time span used for the calculation of daily radiation sums.</description>
+      <value>4; 20</value>
+    </option>
+    <option varname="HOUR_STEP" type="double" parent="PERIOD">
+      <name>Resolution [h]</name>
+      <description>Time step size for a day's calculation given in hours.</description>
+      <value min="0.000000" max="24.000000">4</value>
+    </option>
+	</parameters>
+		<tools>
+		<tool library="ta_morphometry" tool="8" name="Multiresolution Index of Valley Bottom Flatness (MRVBF)">
+			<input id="DEM">DEM</input>
+			<output id="MRVBF">MRVBF</output>
+			<output id="MRRTF">MRRTF</output>
+			<option id="T_SLOPE">MRVBF_THRESH</option>
+		</tool>
+		<tool library="ta_morphometry" tool="12" name="Diurnal Anisotropic Heat">
+			<input id="DEM">DEM</input>
+			<output id="DAH">DAH</output>
+		</tool>
+		<tool library="ta_morphometry" tool="18" name="Topographic Position Index (TPI)">
+			<input id="DEM">DEM</input>
+			<output id="TPI">TPI</output>
+			<option id="STANDARD">1</option>
+			<option id="RADIUS">50</option>
+		</tool>
+		<tool library="ta_morphometry" tool="16" name="Terrain Ruggedness Index (TRI)">
+			<input id="DEM">DEM</input>
+			<output id="TRI">TRI</output>
+			<option id="RADIUS">2</option>
+		</tool>
+		<tool library="ta_lighting" tool="5" name="Topographic Openness">
+			<input id="DEM">DEM</input>			
+			<output id="POS">POS</output>
+			<output id="NEG">NEG</output>
+		</tool>
+		<tool library="ta_lighting" tool="2" name="Potential Incoming Solar Radiation">
+			<input id="GRD_DEM">DEM</input>			
+			<output id="GRD_DIRECT">DIRECT</output>
+			<output id="GRD_DIFFUS">DIFFUSE</output>
+			<option id="LOCATION" varname="true">LOCATION</option>
+		    <option id="LATITUDE" varname="true">LATITUDE</option>
+		    <option id="PERIOD" varname="true">PERIOD</option>
+		    <option id="DAY" varname="true">DAY</option>
+		    <option id="DAY_STOP" varname="true">DAY_STOP</option>
+		    <option id="DAYS_STEP" varname="true">DAYS_STEP</option>
+		    <option id="MOMENT" varname="true">MOMENT</option>
+		    <option id="HOUR_RANGE" varname="true">HOUR_RANGE</option>
+		    <option id="HOUR_STEP" varname="true">HOUR_STEP</option>
+		</tool>
+	</tools>
+</toolchain>
