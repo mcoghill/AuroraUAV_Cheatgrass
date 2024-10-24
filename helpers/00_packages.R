@@ -40,7 +40,7 @@ if(i) {
 # A note on versions: There is a bug from version 9.5.1 on that prevents the 
 # "Basic Terrain Analysis" tool to proceed. I have notified the SAGA GIS team
 # of this issue, hopefully it will be fixed in future versions.
-saga_ver <- "9.5.0"
+saga_ver <- "9.6.1"
 url <- paste0("https://sourceforge.net/projects/saga-gis/files/SAGA%20-%20",
               strsplit(saga_ver, "\\.")[[1]][1], "/SAGA%20-%20",
               saga_ver, "/saga-", saga_ver, "_x64.zip/")

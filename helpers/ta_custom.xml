@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<toolchain saga-version="9.5.0">
+<toolchain saga-version="9.6.1">
 	<group>ta_morphometry</group>
-	<identifier>twi</identifier>
+	<identifier>custom_toolchain</identifier>
 	<name>Custom Toolchain</name>
 	<author>M.Coghill (c) 2024</author>
 	<description>
@@ -42,10 +42,11 @@
 	<output varname="DIFFUSE" type="grid" parent="GRID_SYSTEM">
 		<name>Diffuse Insolation</name>
 	</output>
-	<option varname="MRVBF_THRESH" type="double">
-		<name>MRVBF - Initial Threshold for Slope</name>
-		<value>179.153539882744</value>
-	</option>
+	<option varname="T_SLOPE" type="double">
+      <name>Initial Threshold for Slope</name>
+      <description></description>
+      <value min="0.000000" max="100.000000">16</value>
+  </option>
 	<option varname="LOCATION" type="choice">
       <name>Location</name>
       <description></description>
@@ -99,7 +100,7 @@
 			<input id="DEM">DEM</input>
 			<output id="MRVBF">MRVBF</output>
 			<output id="MRRTF">MRRTF</output>
-			<option id="T_SLOPE">MRVBF_THRESH</option>
+			<option id="T_SLOPE" varname="true">T_SLOPE</option>
 		</tool>
 		<tool library="ta_morphometry" tool="12" name="Diurnal Anisotropic Heat">
 			<input id="DEM">DEM</input>
