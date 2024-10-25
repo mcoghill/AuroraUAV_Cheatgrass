@@ -1,5 +1,5 @@
 ---
-title: "ST_02_LAS Processing"
+title: "ST_02_Predictor Layers"
 author: "Matthew Coghill"
 format: html
 editor: visual
@@ -206,9 +206,9 @@ dtm_chm_mos <- do.call(c, lapply(c("DTM", "CHM"), function(x) {
     target_template = aoi_r, 
     file_list = file.path(tempdir(), paste0(x, "_file_list.txt")),
     overlap = 5,
-    blend_dist = 10,
+    blend_dist = 15,
     blend_bnd = 0,
-    match = 0)
+    match = ifelse(x == "DTM", 3, 0))
   
   return(rast_mosaic)
 }))
@@ -338,7 +338,7 @@ clm_mosaics <- do.call(c, lapply(names(clm_par[[1]]), function(x) {
     target_template = aoi_r, 
     resampling = rsmp,
     overlap = 5,
-    blend_dist = 10,
+    blend_dist = 15,
     blend_bnd = 0,
     match = 0) 
   
@@ -356,7 +356,8 @@ Resample reflectance layers and generate spectral indices
 ```{r MS_Indices, include=FALSE}
 
 # Could potentially be in future_lapply loop instead.
-ms_lowres <- lapply(seq_len(nrow(ms_df)), function(x) {
+plan(multisession, workers = ncores() %/% 2)
+ms_lowres <- future_lapply(seq_len(nrow(ms_df)), function(x) {
   
   # Define inputs and outputs
   y <- pull(ms_df, ms)[x]
@@ -383,10 +384,13 @@ ms_lowres <- lapply(seq_len(nrow(ms_df)), function(x) {
   
   # Resample to lower resolution using the "cubicspline" method, then mask the 
   # raster to the flight area, then write each layer to its own file
-  rr <- resample(r, dummy, method = "cubicspline", threads = TRUE) %>% 
+  rr <- resample(r, dummy, method = "cubicspline", threads = FALSE) %>% 
     mask(kml) %>% 
     writeRaster(r_out, overwrite = TRUE)
-})
+  return(sources(rr))
+}, future.seed = NULL)
+plan(sequential)
+ms_lowres <- lapply(ms_lowres, rast)
 
 # Mosaic each band together
 bands_mos <- do.call(c, lapply(names(ms_lowres[[1]]), function(x) {
@@ -408,7 +412,7 @@ bands_mos <- do.call(c, lapply(names(ms_lowres[[1]]), function(x) {
     target_definition = 1,
     target_template = aoi_r, 
     overlap = 5,
-    blend_dist = 10,
+    blend_dist = 15,
     blend_bnd = 0,
     match = 0) 
   
