@@ -205,10 +205,10 @@ dtm_chm_mos <- do.call(c, lapply(c("DTM", "CHM"), function(x) {
     target_definition = 1,
     target_template = aoi_r, 
     file_list = file.path(tempdir(), paste0(x, "_file_list.txt")),
-    overlap = 6,
+    overlap = 5,
     blend_dist = 10,
-    blend_bnd = 1,
-    match = 3)
+    blend_bnd = 0,
+    match = 0)
   
   return(rast_mosaic)
 }))
@@ -245,7 +245,7 @@ int_ids <- paste0(c(
 
 # Generate climate variables by flight area. This will save memory and time
 # compared to generating climate variables for the entire area.
-plan(multisession, workers = ncores() %/% 4)
+plan(multisession, workers = ncores() %/% 6)
 clm_par <- future_lapply(seq_len(nrow(dtm_df)), function(x) {
   y <- pull(dtm_df, dtm)[x]
   clm_subdir <- file.path(clm_dir, gsub(".tif", "", basename(y)))
@@ -337,10 +337,10 @@ clm_mosaics <- do.call(c, lapply(names(clm_par[[1]]), function(x) {
     target_definition = 1,
     target_template = aoi_r, 
     resampling = rsmp,
-    overlap = 6,
+    overlap = 5,
     blend_dist = 10,
-    blend_bnd = 1,
-    match = 3) 
+    blend_bnd = 0,
+    match = 0) 
   
   return(clm_mosaic)
 }))
@@ -355,6 +355,7 @@ Resample reflectance layers and generate spectral indices
 
 ```{r MS_Indices, include=FALSE}
 
+# Could potentially be in future_lapply loop instead.
 ms_lowres <- lapply(seq_len(nrow(ms_df)), function(x) {
   
   # Define inputs and outputs
@@ -406,10 +407,10 @@ bands_mos <- do.call(c, lapply(names(ms_lowres[[1]]), function(x) {
     file_list = file.path(tempdir(), paste0(x, "_file_list.txt")),
     target_definition = 1,
     target_template = aoi_r, 
-    overlap = 6,
+    overlap = 5,
     blend_dist = 10,
-    blend_bnd = 1,
-    match = 3) 
+    blend_bnd = 0,
+    match = 0) 
   
   return(band_mosaic)
 }))
@@ -452,7 +453,7 @@ ta_basic <- saga$ta_compound$basic_terrain_analysis(
   chnl_dist = paste0(od, "chnl_dist.tif"),
   vall_depth = paste0(od, "valley_depth.tif"),
   rsp = paste0(od, "relative_slope_position.tif"),
-  .all_outputs = FALSE, .verbose = TRUE)
+  .verbose = TRUE)
 ta_basic <- do.call(c, unname(ta_basic))
 dtmp <- sum(dtm, ta_basic[["sinks"]], na.rm = TRUE, 
             filename = file.path(tempdir(), "DTM-preproc.tif"),
