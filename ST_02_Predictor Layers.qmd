@@ -5,13 +5,17 @@ format: html
 editor: visual
 ---
 
-## LAS processing
+# South Thompson - Predictor Layer Generation
 
-This should be the first script to be run before modelling occurs. There are a number of items that need to happen - First, DEM's need to be created from LAS files at a 0.5m\^2 resolution. These DEM's will then need to be trimmed to their respective flight areas, and then mosaicked together using SAGA GIS. Once there is a single DEM for each camera, then SAGA GIS can be used to create the DEM derivatives. The reflectance layers can then be resampled to match the extents of the DEM derived layers as well.
+This script has very specific parameters required. First, all remote sensing data needs to be processed. For the South Thompson area, there are two main sources for this. First, a LAS file is required from processing RGB imagery through Pix4DMapper. This would have been originally acquired with the P1 camera. Next, multispectral images for each of those same flight areas needs to be collected and raster images of each band are required. Flights from this project have been named numerically, occasionally with a letter to indicate sub-flights for larger areas. An example flight name would be "5b". Each flight area should have both multispectral and RGB imagery taken from it, though some of the flight areas needed to be adjusted or constrained due to terrain limitations in some of the areas leading to inconsistent flight boundaries between RGB and multispectral flights. Despite this inconsistency, both RGB and multispectral imagery fully cover the entirety of the South Thompson project area, it just leads to slightly different processing pathways.
 
-First, load packages.
+Overall, this script will tackle the predictor layer generation for the entire modelling process. Fundamentally, the DTM and CHM are first generated from the LAS files. The DTM is then used to derive climate based layers and terrain based layers. Climate layers include seasonal (summer) variables from 2023, which is the closest dataset that may be used at the time of writing. Terrain based variables include those that are included in the "basic terrain analysis" toolchain built into SAGA GIS, as well as a number of other useful terrain based variables. Finally, multispectral indices (e.g.: NDVI) are generated from the multispectral bands gathered from Pix4DMapper processing.
 
-```{r setup, include=FALSE}
+## Setup
+
+The first step in this process involves loading the required packages. Some base options for this script are also set at this stage. Note that we require SAGA GIS version 9.6.1 or above for this script to proceed.
+
+```{r init, include=FALSE}
 
 ls <- c("tidyverse", "terra", "lidR", "lasR", "Rsagacmd", "ClimateNAr",
         "RStoolbox", "future.apply")
@@ -33,7 +37,9 @@ saga <- saga_gis(saga_path, raster_format = "GeoTIFF", all_outputs = FALSE)
 # Start over? Warning: deletes everything from main layer folder.
 sanitize <- TRUE
 
-# Set file access either over SFTP connection, or through Synology Drive
+# Set file access either over SFTP connection, Local LAN, or through the 
+# Synology Drive app (i.e.: "SFTP", "Local", "SynologyDrive", or whatever the
+# folder name is for your Synology Drive app location)
 serv_conn <- "SynologyDrive"
 
 # Set raster resolution (coarse for testing, 0.5 for production)
@@ -41,13 +47,22 @@ rres <- 0.5
 
 ```
 
-The files that we will be working with are located on the remote server. File access may be granted by contacting info\@aurorauav.com
+The files that we will be working with are located on the remote server. File access may be granted by contacting info\@aurorauav.com.
+
+## File/folder initialization
+
+Files are required off of the remote server, which then get processed locally in a temporary directory, and the final outputs are saved back to the remote server. Temporary files are removed as soon as they are able to be removed in order to save space on your local drives, though at times this script can produce \~100GB of temporary files. The directories for each step of the way are created at this time.
+
+Additionally, this chunk will ensure that the KML/KMZ files (i.e.: flight boundaries) that are being used are meant for either the RGB or multispectral (MS) images being processed. This is based on file naming and file locations. For example, a given flight area might have both MS and RGB files within that directory, and a single KML file in that same directory would indicate that they share the same flight area.
 
 ```{r Directories, include=FALSE}
 
+# Determine server directory method (change username if using SFTP connection)
 if(serv_conn == "SFTP") {
   user <- "mcoghill"
   serv <- paste0("//", user, "@aurorauav.synology.me/Cheatgrass")
+} else if (serv_conn == "Local") {
+  serv <- "//AuroraNAS/Cheatgrass"
 } else {
   serv <- file.path(Sys.getenv("USERPROFILE"), "SynologyDrive/Cheatgrass")
 }
@@ -126,9 +141,11 @@ aoi_r <- rast(aoi_ext, res = rres, crs = terra::crs(aoi), vals = NA)
 
 ```
 
-LAS tile processing. First, split large LAS files into several smaller tiles (accomplished in the `lidR` package), then use the `lasR` package to clean, classify, and generate the DTM/DEM and CHM. Once the these variables have been created, mask those layers to the shape of the flight areas provided. Finally, mosaic the DTM images together. The smaller DTM files will be used for processing later in the `ClimateNAr` package and in the `rstoolbox` package as well, while the mosaicked DTM will be used to generate terrain variables.
+## LAS to DTM and CHM
 
-For the `lasR` package functions: this package flows inputs and outputs in a series of functions called a "pipeline". At any stage in the pipeline you can decide to output files if needed. We don't need to worry about buffering LAS tiles here either, that is all taken care of in the background without the need for (or ability to provide) input.
+Each flight area contains its own LAS file. For each of these LAS files we first have to split the single large LAS file into several smaller tiles (accomplished in the `lidR` package). Next, use the `lasR` package to clean the LAS tiles and generate the DTM/DEM and CHM. We get to make use of the "pipeline" functionality within the `lasR` package, where multiple functions are strung together by tying together inputs and outputs to efficiently produce desired products (e.g.: DTM). Outputs can be stored in RAM, offering much quicker processing to get to an output.
+
+Once a DTM and CHM have been created for a given flight area, mask those layers to the shape of the flight areas provided. These smaller DTM files will be used for processing later in the `ClimateNAr` package because it is more efficient to generate the climate variables in this manner compared to generating climate variables from a single large mosaicked DTM.
 
 ```{r LAS_processing, include=FALSE}
 
@@ -166,7 +183,7 @@ las_proc <- lapply(seq_len(nrow(rgb_df)), function(x) {
     res = rres, operators = "max", filter = "-drop_z_below 0", ofile = "")
   pf_pipe <- pit_fill(chm_pipe, ofile = chm_raw_out)
   pipeline <- ivf_pipe + tin_pipe + dtm_pipe + norm_pipe + chm_pipe + pf_pipe
-  set_parallel_strategy(nested(ncores() / 2L, 2L))
+  set_parallel_strategy(nested(ncores() %/% 4L, 4L))
   dtm_chm_raw <- exec(pipeline, on = tile_out, progress = TRUE)
   dtm_chm_raw <- c(dtm_chm_raw[[1]], dtm_chm_raw[[2]])
   names(dtm_chm_raw) <- paste0(
@@ -189,7 +206,9 @@ rm(raw_dtms, tile_dir)
 
 ```
 
-Mosiac DTM's and CHM's using SAGA GIS's mosaic function. This function does not output the mosaicked file with a proper CRS, so it needs to be brought back into R and reassigned.
+## DTM and CHM merge
+
+Next, mosaic the DTM and CHM images together. We make use of a "match" parameter in SAGA GIS's `mosaic` function for the DTM which ultimately smooths the DTM between adjacent flight areas. This parameter is not used in other mosaicking tasks carried out in this project.
 
 ```{r DTM_Mosaic, include=FALSE}
 
@@ -215,11 +234,11 @@ dtm_chm_mos <- do.call(c, lapply(c("DTM", "CHM"), function(x) {
 
 ```
 
-## DTM derived layers
+## Climate based layers
 
-Start with ClimateBC/ClimateNAr processing. As of later 2024, a new ClimateNAr package has been developed that does not require ClimateBC/ClimateNA be downloaded to your computer. Instead, the R package is hosted on a private repository where the developers have control over the file size of the package, meaning that they can store a bunch of the required data in the package itself instead of needing to link it to another downloaded folder. Instructions for downloading and installing this package are listed in the "00_install.R" file.
+As of later 2024, a new `ClimateNAr` package has been developed that does not require ClimateBC/ClimateNA be downloaded to your computer. Instead, the R package is hosted on a private repository where the developers have control over the file size of the package, meaning that they can store a bunch of the required data in the package itself instead of needing to link it to another downloaded folder. Instructions for downloading and installing this package are listed in the "00_install.R" file. This also might have made the function usable across other OS's, which was not the case before.
 
-It is quicker and more memory efficient to generate climate layers by flight area, and then mosaic each climate layer together at the end rather than trying to generate the climate layers for the entire area in a single function. For this, we rely on the original DTM's before they were mosaicked.
+It is quicker and more memory efficient to generate climate layers by flight area, and then mosaic each climate layer together at the end rather than trying to generate the climate layers for the entire area in a single function. For this, we rely on the original DTM's before they were mosaicked. These original DTM's get thrown into a parallelized loop to take advantage of the amount of cores that your PC has, with the drawback being memory: the `ClimateNAr()` function requires a lot of memory on each loaded core, so we can't make full use of the processor potential without running out of memory. Tune core usage as needed.
 
 ```{r Climate_attributes, include=FALSE}
 
@@ -317,8 +336,8 @@ clm_par <- future_lapply(seq_len(nrow(dtm_df)), function(x) {
 plan(sequential)
 clm_par <- lapply(clm_par, rast)
 
-# Now, mosaic and write these mosaics to a temporary file (CRS information 
-# does not seem to play nicely with SAGA GIS and R).
+# Mosaic the climate layers together, following each layers respective resampling
+# strategy
 clm_mosaics <- do.call(c, lapply(names(clm_par[[1]]), function(x) {
   
   # Get every one of the rasters based on file names
@@ -346,12 +365,14 @@ clm_mosaics <- do.call(c, lapply(names(clm_par[[1]]), function(x) {
 }))
 
 # Cleanup
-unlink(clm_dir, recursive = TRUE)
-rm(clm_dir)
+unlink(c(dtm_dir, clm_dir), recursive = TRUE)
+rm(dtm_dir, clm_dir)
 
 ```
 
-Resample reflectance layers and generate spectral indices
+## Multispectral indices
+
+Multispectral indices are generated from reflectance layers (i.e.: blue, green, red, NIR, and red-edge bands). There are many different indices that may be generated from these bands, and those are calculated using the `spectralIndices()` function in the `rstoolbox` package. Ultimately, we want these indices to match the resolution and extent of the mosaicked DTM, so first each band for each flight area needs to be resampled to a lower resolution (0.5m\^2). Once resampled, the bands can be mosaicked together (e.g.: all blue bands in a single raster image). Finally, once all bands are generated, the spectral indices may be generated.
 
 ```{r MS_Indices, include=FALSE}
 
@@ -373,7 +394,7 @@ ms_lowres <- future_lapply(seq_len(nrow(ms_df)), function(x) {
   r_names <- sapply(r_names, function(y) y[length(y)])
   names(r) <- r_names
   
-  # Create output directory for the flight, and define the DTM which will be 
+  # Create output directory for the flight, and a dummy raster which will be 
   # used to downsample the reflectance layers to
   r_out_dir <- file.path(ms_dir, flight_id)
   r_out <- file.path(r_out_dir, paste0(r_names, ".tif"))
@@ -427,10 +448,12 @@ s <- spectralIndices(
               overwrite = TRUE)
 
 # Cleanup
-unlink(c(dtm_dir, ms_dir), recursive = TRUE)
-rm(dtm_dir, ms_dir)
+unlink(ms_dir, recursive = TRUE)
+rm(ms_dir)
 
 ```
+
+## Terrain layers
 
 Finally, create terrain layers from the mosaicked DTM. The variables generated include the ones from the basic terrain analysis, as well as a number of variables which are included in a toolchain provided from an XML file that I wrote.
 
