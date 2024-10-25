@@ -8,10 +8,6 @@
 
 # User-specific files
 .Ruserdata
-/*.tif
-/*.las
-/*.pdf
-/*.kml
 
 # Example code in package build process
 *-Ex.R
