@@ -40,7 +40,7 @@ sanitize <- TRUE
 # Set file access either over SFTP connection, Local LAN, or through the 
 # Synology Drive app (i.e.: "SFTP", "Local", "SynologyDrive", or whatever the
 # folder name is for your Synology Drive app location)
-serv_conn <- "SynologyDrive"
+serv_conn <- "Synology"
 
 # Set raster resolution (coarse for testing, 0.5 for production)
 rres <- 0.5
@@ -61,11 +61,11 @@ Additionally, this chunk will ensure that the KML/KMZ files (i.e.: flight bounda
 if(serv_conn == "SFTP") {
   user <- "mcoghill"
   serv <- paste0("//", user, "@aurorauav.synology.me/Cheatgrass")
-} else if (serv_conn == "Local") {
+} else if(serv_conn == "Local") {
   serv <- "//AuroraNAS/Cheatgrass"
-} else {
+} else if(serv_conn == "Synology") {
   serv <- file.path(Sys.getenv("USERPROFILE"), "SynologyDrive/Cheatgrass")
-}
+} else serv <- serv_conn
 
 # Initialize directories
 proj <- "South Thompson"
