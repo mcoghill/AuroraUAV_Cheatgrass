@@ -40,19 +40,27 @@ if(i) {
 # A note on versions: There is a bug from version 9.5.1 on that prevents the 
 # "Basic Terrain Analysis" tool to proceed. I have notified the SAGA GIS team
 # of this issue, hopefully it will be fixed in future versions.
-saga_ver <- "9.6.1"
-url <- paste0("https://sourceforge.net/projects/saga-gis/files/SAGA%20-%20",
-              strsplit(saga_ver, "\\.")[[1]][1], "/SAGA%20-%20",
-              saga_ver, "/saga-", saga_ver, "_x64.zip/")
-saga_dir <- file.path("C:/SAGA-GIS")
-dir.create(saga_dir, showWarnings = FALSE)
-saga_zip <- file.path(saga_dir, paste0("saga-", saga_ver, "_x64.zip"))
-download.file(url, saga_zip, mode = "wb") # mode argument only needed on Windows
-unzip(saga_zip, exdir = saga_dir)
-unlink(saga_zip)
+if(.Platform$OS.type == "windows") {
+  saga_ver <- "9.6.1"
+  url <- paste0("https://sourceforge.net/projects/saga-gis/files/SAGA%20-%20",
+                strsplit(saga_ver, "\\.")[[1]][1], "/SAGA%20-%20",
+                saga_ver, "/saga-", saga_ver, "_x64.zip/")
+  saga_dir <- file.path("C:/SAGA-GIS")
+  dir.create(saga_dir, showWarnings = FALSE)
+  saga_zip <- file.path(saga_dir, paste0("saga-", saga_ver, "_x64.zip"))
+  download.file(url, saga_zip, mode = "wb") # mode argument only needed on Windows
+  unzip(saga_zip, exdir = saga_dir)
+  unlink(saga_zip)
+  saga_tc <- file.path(saga_dir, paste0("saga-", saga_ver, "_x64"), "tools/toolchains")
+} else {
+  warning("The below commands are likely very machine specific, 
+          \ruse these as a general guidance only!")
+  system("sudo apt-get install saga")
+  saga_tc <- file.path("/usr/share/saga/toolchains")
+  system(paste0("sudo chmod 777 ", saga_tc))
+}
 
 # A custom toolchain has been provided for some terrain layers. Copy this XML
 # file to the SAGA toolchain folder to allow it to be recognized in Rsagacmd:
 xml_file <- list.files("helpers", pattern = ".xml$", full.names = TRUE)
-saga_tc <- file.path(saga_dir, paste0("saga-", saga_ver, "_x64"), "tools/toolchains")
 file.copy(xml_file, saga_tc, overwrite = TRUE)
