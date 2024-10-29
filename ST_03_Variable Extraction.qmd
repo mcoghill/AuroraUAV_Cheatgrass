@@ -113,9 +113,18 @@ cov_layrs <- list.files(layr_dir, pattern = ".tif$", full.names = TRUE)
 cov_layrs <- cov_layrs[grep("Climate_|MS_|Terrain_", basename(cov_layrs))]
 covs <- rast(cov_layrs)
 
-# Determine layers to use (i.e.: remove bad layers)
+# Determine layers to remove: ones with the same min and max value
 covs_data <- minmax(covs, compute = TRUE)
 covs <- covs[[which(covs_data[2, ] - covs_data[1, ] > 0)]]
+
+# Determine layers to remove: ones with more NA data compared to other layers
+covs_no_na <- global(covs, fun = "isNA") %>% 
+  as.data.frame() %>% 
+  rownames_to_column("layer") %>% 
+  filter(isNA > 0) %>% 
+  filter(isNA < quantile(isNA, prob = 0.98)) %>% 
+  pull(layer)
+covs <- covs[[covs_no_na]]
 
 # Perform data extraction
 cov_extract <- extract(covs, fd_full, bind = TRUE) %>% 
