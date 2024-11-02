@@ -4,13 +4,14 @@
 # CRAN packages
 ls <- c("tidyverse", "lidR", "sf", "sfheaders", "future.apply", "terra", 
   "data.table", "units", "rmapshaper", "lwgeom", "RCSF", "lme4", "devtools",
-  "RStoolbox", "mlr3verse", "mlr3spatial", "mlr3spatiotempcv", "readxl",
+  "RStoolbox", "mlr3verse", "mlr3spatiotempcv", "readxl", "ranger",
   "Rsagacmd")
 
 new_packages <- ls[!(ls %in% installed.packages()[, "Package"])]
 if(length(new_packages)) install.packages(new_packages)
 if(!"lasR" %in% installed.packages()[, "Package"])
   install.packages("lasR", repos = "https://r-lidar.r-universe.dev")
+devtools::install_github("mcoghill/mlr3spatial@prob")
 
 # ClimateNAr package
 # First, check if ClimateNAr is already installed and up to date.
@@ -27,10 +28,11 @@ if(i) {
   options(timeout = Inf)
   url <- "https://climatena.ca/downloads/ClimateNAr.zip"
   dl_path <- file.path(tempdir(), "ClimateNAr.zip")
-  download.file(url, destfile = dl_path)
+  download.file(url, destfile = dl_path, method = "wget")
   
   # Next, unzip the file into your R package installation folder
-  install.packages(dl_path, repos = NULL, type = "source")
+  unzip(dl_path, exdir = .libPaths()[1])
+  # install.packages(dl_path, repos = NULL, type = "source")
 }
 
 # Install my custom lidR function
