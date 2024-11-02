@@ -63,18 +63,44 @@ f_data <- read_excel(f_data_p, skip = 2, col_types = "guess") %>%
   mutate(cover = replace_na(cover, 0))
 
 f_pts <- do.call(rbind, lapply(f_pts_p, function(x) {
-  kml <- st_read(x, quiet = TRUE) %>% 
-    janitor::clean_names() %>% 
-    select(-description) %>% 
-    rename(plot_id = name) %>% 
-    filter(startsWith(plot_id, "Block")) %>% 
-    mutate(plot_id = gsub("Block ", "", plot_id),
-           plot_id = gsub("_P", "_", plot_id))
+  
+  if(nrow(st_layers(x)) > 1) {
+    kml1 <- st_read(x, layer = st_layers(x)[2, "name"], quiet = TRUE) %>% 
+      janitor::clean_names() %>% 
+      select(-description) %>% 
+      rename(plot_id = name) %>% 
+      mutate(plot_id = gsub("Block |Blk ", "", plot_id), 
+             plot_id = gsub(" - ", "_", plot_id),
+             plot_id = gsub("_P", "_", plot_id))
+    clean <- cbind(st_drop_geometry(kml1), 
+                   as.data.frame(st_coordinates(kml1))) %>% 
+      filter(Z > 0)
+    kml2 <- st_read(x, layer = st_layers(x)[3, "name"], quiet = TRUE) %>% 
+      janitor::clean_names() %>% 
+      select(-description) %>% 
+      rename(plot_id = name) %>% 
+      filter(!grepl("Add", plot_id)) %>% 
+      mutate(plot_id = gsub("Block |Blk ", "", plot_id), 
+             plot_id = gsub(" - ", "_", plot_id),
+             plot_id = gsub("_P", "_", plot_id))
+    kml <- rbind(
+      kml1 %>% filter(plot_id %in% clean$plot_id),
+      kml2)
+  } else {
+    kml <- st_read(x, quiet = TRUE) %>% 
+      janitor::clean_names() %>% 
+      select(-description) %>% 
+      rename(plot_id = name) %>% 
+      filter(startsWith(plot_id, "Block")) %>% 
+      mutate(plot_id = gsub("Block ", "", plot_id),
+             plot_id = gsub("_P", "_", plot_id))
+  }
   if(!st_geometry_type(kml, by_geometry = FALSE) == "POINT") {
     kml <- kml %>% st_collection_extract("POINT")
   }
-  clean <- cbind(st_drop_geometry(kml), as.data.frame(st_coordinates(kml))) %>% 
-    filter(Z > 0)
+  
+  clean <- cbind(st_drop_geometry(kml), as.data.frame(st_coordinates(kml)))
+  if(nrow(st_layers(x)) == 1) clean <- filter(clean, Z > 0)
   kml_clean <- kml %>% 
     filter(plot_id %in% clean$plot_id) %>% 
     separate_wider_delim(plot_id, "_", names = c("block", "plot")) %>% 
@@ -92,12 +118,42 @@ fd <- left_join(f_pts, f_data, by = c("block", "plot")) %>%
   relocate(block, plot, surveyor, cover) %>% 
   mutate(presence = cover > 0, .after = cover)
 
-# Anything missing?
-missing <- filter(fd, is.na(cover))
+# Missing data - field data present but no associated point
+# Assume missing point data came from Grant
+missing_fpts <- left_join(f_data, f_pts, by = c("block", "plot")) %>% 
+  st_drop_geometry() %>% 
+  select(-geometry) %>% 
+  filter(is.na(surveyor)) %>% 
+  mutate(plot_id = paste0(block, "_", plot),
+         surveyor = "Grant",
+         presence = cover > 0, .after = cover)
+
+fd_missing <- st_read(f_pts_p[1], quiet = TRUE) %>% 
+  janitor::clean_names() %>% 
+  select(-description) %>% 
+  rename(plot_id = name) %>% 
+  filter(startsWith(plot_id, "Block")) %>% 
+  mutate(plot_id = gsub("Block ", "", plot_id),
+         plot_id = gsub("_P", "_", plot_id)) %>% 
+  filter(plot_id %in% missing_fpts$plot_id) %>% 
+  st_zm() %>% 
+  st_transform(st_crs(air_photo))
+
+fd_missing_join <- left_join(missing_fpts, fd_missing, by = "plot_id") %>% 
+  select(-plot_id) %>% 
+  st_sf()
+
+fd <- rbind(fd, fd_missing_join) %>% 
+  arrange(block, plot)
+
+# Missing data - no field data, but there is a point from that survey
+missing_fdata <- filter(fd, is.na(cover)) %>% 
+  st_drop_geometry()
+write.csv(missing_fdata, file.path(fd_dir, "missing.csv"), row.names = FALSE)
 
 # Create a single large dataset for raster extraction in next chunk
 fd_full <- rbind(
-  fd %>% select(cover, presence),
+  fd %>% select(cover, presence) %>% filter(!is.na(cover)),
   air_photo %>% mutate(cover = NA)) %>% vect()
 
 ```
