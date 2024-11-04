@@ -4,14 +4,13 @@
 # CRAN packages
 ls <- c("tidyverse", "lidR", "sf", "sfheaders", "future.apply", "terra", 
   "data.table", "units", "rmapshaper", "lwgeom", "RCSF", "lme4", "devtools",
-  "RStoolbox", "mlr3verse", "mlr3spatiotempcv", "readxl", "ranger",
-  "Rsagacmd")
+  "RStoolbox", "mlr3verse", "mlr3spatial", "mlr3spatiotempcv", "mlr3benchmark",
+  "readxl", "vip", "ranger", "Rsagacmd")
 
 new_packages <- ls[!(ls %in% installed.packages()[, "Package"])]
 if(length(new_packages)) install.packages(new_packages)
 if(!"lasR" %in% installed.packages()[, "Package"])
   install.packages("lasR", repos = "https://r-lidar.r-universe.dev")
-devtools::install_github("mcoghill/mlr3spatial@prob")
 
 # ClimateNAr package
 # First, check if ClimateNAr is already installed and up to date.
