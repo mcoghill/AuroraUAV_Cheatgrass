@@ -9,8 +9,8 @@ editor: visual
 
 ```{r init, include=FALSE}
 
-ls <- c("tidyverse", "terra", "sf", "mlr3verse", "mlr3spatial",     
-        "mlr3spatiotempcv", "future")  
+ls <- c("tidyverse", "terra", "sf", "mlr3verse", "mlr3spatial", "mlr3benchmark",
+        "mlr3spatiotempcv", "future", "vip")  
 invisible(suppressPackageStartupMessages(   
   lapply(ls, library, character.only = TRUE))) 
 rm(ls)  
@@ -19,6 +19,14 @@ rm(ls)
 # Synology Drive app (i.e.: "SFTP", "Local", "SynologyDrive", or whatever the
 # folder name is for your Synology Drive app location) 
 serv_conn <- "Synology" 
+
+# Get memory in KB
+mem <- as.numeric(
+  system("awk '/MemTotal/ {print $2}' /proc/meminfo", intern = TRUE))
+
+# Use at own risk:
+# options(parallelly.fork.enable = TRUE)
+
 ```
 
 ## Load field data, points, and air photo points
@@ -75,38 +83,44 @@ covs <- rast(cov_layrs)
 
 ## Presence, spatial CV
 
+We begin modelling with the main probability model showing how likely it is that cheatgrass is present in an area. This is the best model that can be produced with the given data as we are able to make use of both field data and air-photo calls to generate the map. First, we create a bunch of models from a leave-one-out cross validation resampling that we use to evaluate variable importance with. The variable importance values are summed across each of the model runs, and those summed values will replace the variable importance values for the "best model" found from that resampling run (i.e.: it doesn't matter really what the results of this best model was since we only need to use it for it's importance values). With aggregated variable importance found, we can pipe that in to our modelling pipeline as a "feature filtering" step which is combined with hyperparameter tuning at the same stage instead of wrapped in its own auto feature selection step. This was crucial as it vastly improved the modelling speed (don't need to have a 3rd layer of recursion which needs to be resampled) and modelling results (more data can be used to generate models with). With the filtered learner pipeline in place, it gets used as the learner for the autotuner which tunes the num.trees and mtry values of the random forest model. This is the "inner" resampling stage; the best results of the inner resampling stage inform the outer resampling what the best parameters should be set to. Using all of the data that was in the inner resampling as training data, it builds a model and then tests it with the outer test data which has never been used for modelling. This gets repeated until all of the data has been used as testing data exactly once. The best model results are extracted as well as the model in order to create the map prediction.
+
 ```{r modelling, include=FALSE}
 
 tsk_pres <- as_task_classif_st(  
-  cheat_pres, target = "presence", positive = "TRUE") 
+  cheat_pres, target = "presence", positive = "TRUE")
+tsk_pres$set_col_roles("block", remove_from = "feature")
+tsk_pres$set_col_roles("presence", roles = c("target", "stratum"))
 
 # Create the learner for feature filtering 
-lrn_filter = lrn("classif.ranger", importance = "impurity",      
-                 predict_type = "prob",             
-                 num.trees = to_tune(500, 500))  
+lrn_filter <- lrn(
+  "classif.ranger", importance = "impurity", predict_type = "prob")
 
-# Create the "auto-tuner" for feature filtering (only used to simplify resampling)
-at_filter <- auto_tuner(   
-  tuner = tnr("grid_search"),   
-  learner = lrn_filter,  
-  terminator = trm("none"),   
-  measure = msr("oob_error"),
-  resampling = rsmp("loo"), # leave one out resampling, should find most accurate feature importance   
-  store_models = TRUE )  
+# Train a ranger learner which will have stored feature importances. This order
+# of features is what will be used downstream for feature filtering.
+plan(multisession, workers = availableCores() %/% 4)
+rr_filter <- resample(tsk_pres, lrn_filter, rsmp("loo"), store_models = TRUE)
+plan(sequential)
 
-# Train the auto tuned model so that we get the best order of features to be 
-# used downstream
-at_filter$train(tsk_pres)  
+# spoof (aggregate) the importance values
+rr_learners <- rr_filter_results$learner
+rr_imps <- as.data.frame(
+  sapply(rr_learners, function(x) x$importance()))
+rr_imps_vals <- sort(rowSums(rr_imps), decreasing = TRUE)
+rr_filter_results <- as.data.table(rr_filter$score(msr("oob_error")))
+best_filter_id <- which.min(rr_filter_results$oob_error) 
+filter_learner <- rr_filter$learners[[best_filter_id]]$base_learner()
+filter_learner$model$variable.importance <- rr_imps_vals
 
 # Place the best resulting learner into a filtering pipeop 
-po_filter = po("filter", filter = flt("importance", learner = at_filter$learner),
-               filter.nfeat = to_tune(1, tsk_pres$ncol - 1))  
+po_filter = po("filter", filter = flt("importance", learner = filter_learner),
+               filter.nfeat = to_tune(1, length(tsk_pres$feature_names)))
 
 # Next, create a learner pipeop that will tune the hyperparameters 
 lrn_tune = lrn("classif.ranger", importance = "impurity",        
                predict_type = "prob",            
                num.trees = to_tune(100, 2000),    
-               mtry = to_tune(1, tsk_pres$ncol - 1))  
+               mtry = to_tune(1, length(tsk_pres$feature_names)))  
 po_lrn = po("learner", lrn_tune) 
 
 # Create the graph learner object that will combine these 
@@ -114,28 +128,28 @@ graph = as_learner(po_filter %>>% po_lrn)
 
 # Create the tuning design grid - I figured out how to tune across all mtry 
 # values (yay!) 
-design <- expand.grid(importance.filter.nfeat = (tsk_pres$ncol - 1):4,    
-                      classif.ranger.num.trees = c(500, 1000, 2000), 
-                      classif.ranger.mtry = (tsk_pres$ncol - 1):1) %>%    
+design <- expand.grid(
+  importance.filter.nfeat = length(tsk_pres$feature_names):4,    
+  classif.ranger.num.trees = c(500, 1000, 2000), 
+  classif.ranger.mtry = length(tsk_pres$feature_names):1) %>%    
   dplyr::filter(classif.ranger.mtry <= importance.filter.nfeat) 
 tn <- tnr("design_points", design = as.data.table(design)) 
 
 # Create the auto-tuner object 
-at <- auto_tuner(  
+at <- auto_tuner(
   tuner = tn,  
   learner = graph,  
-  resampling = rsmp("cv", folds = 4),   
+  resampling = rsmp("cv", folds = 6),   
   measure = msr("classif.bbrier"),   
-  terminator = trm("none") 
-)  
+  terminator = trm("none"))  
 
 # Runs both outer and inner loops in parallel 
 plan(list(   
-  tweak(multisession, workers = availableCores() %/% 4),  
-  tweak(multisession, workers = I(4))    # <= force 4 workers
-)) 
+  tweak(multisession, workers = availableCores() %/% 3),  
+  tweak(multisession, workers = I(3))
+))
 rr <- mlr3::resample(
-  tsk_pres, at, rsmp("spcv_coords", folds = 8), store_models = TRUE) 
+  tsk_pres, at, rsmp("spcv_coords", folds = 10), store_models = TRUE)
 plan(sequential) 
 
 # Get the best model for prediction: first, get all outer learners. These would
@@ -146,60 +160,71 @@ outer_learners = lapply(data$learner, "[[", "learner")
 
 # From the same object, extract the table of tuning results which can be viewed
 # and queried 
-outer_results = as.data.table(rr$score(msr("classif.bbrier"))) 
+outer_results = as.data.table(
+  rr$score(msrs(c("classif.bbrier", "classif.ce", "classif.prauc"))))
 
 # Now, from the outer learners, extract the one with the lowest binary Brier
 # score. Note that if the data is imbalanced, we should probably evaluate  
 # models using the area under the precision recall ROC curve (classif.prauc) 
 # according to the documentation
 best_id <- which.min(outer_results$classif.bbrier) 
-best_learner <- outer_learners[[best_id]] 
-best_tune <- data$learner[[best_id]]$tuning_result[, 1:3] 
-best_param_set <- best_learner$param_set  
+best_learner <- outer_learners[[best_id]]$base_learner()
+best_tune <- extract_inner_tuning_results(rr)[best_id, 2:4] 
+best_param_set <- best_learner$param_set 
+best_varimp <- best_learner$importance()
+vip(best_learner, num_features = length(best_varimp))
 
-# If interested in the aggregated results of the inner tuning, or interested in 
-# looking at the results of each model run, you can use this code here to do so 
-# archives = extract_inner_tuning_archives(rr) 
-# inner_learners = mlr3misc::map(archives$resample_result, "learners")  
+# Get some model results:
+best_agg_score <- rr$aggregate(msr("classif.bbrier"))
+ml_prediction <- rr$prediction()
+ml_confusion <- ml_prediction$confusion
+mod_confusion <- rr$predictions()[[best_id]]$confusion
+mod_oob <- best_learner$model$prediction.error
+autoplot(rr, type = "roc")
 
-# using the best learner, generate a map prediction from the predictor rasters
-# Set the num.threads value to use all cores
-best_learner$param_set$values$classif.ranger.num.threads <- availableCores() 
+# Extract the actual ranger model from the mlr3 modelling. Use a custom predict
+# function to extract the "TRUE" probability results only. Also, define the 
+# filename of the output TIF file as well as only the covariates involved in
+# the eventual model. The mlr3spatial package has a handy hidden function
+# "block_size()" which we will use to define the number of blocks (tiles) that
+# the prediction must take place in. The "chunksize" parameter is the size in MB
+# that a chunk should be. Larger values of this will result in fewer tiles, but
+# more RAM usage, so alter this to meet the requirements of your system.
+ranger_model <- best_learner$model
+fun <- function(model, ...) predict(model, ...)$predictions[, "TRUE"]
+prob_path <- file.path(out_dir, paste0(proj, "_cheatgrass_probability_model.tif"))
+prob_covs <- covs[[names(ranger_model$variable.importance)]]
+bs <- mlr3spatial:::block_size(prob_covs, chunksize = 1500)
+prob_predict <- terra::predict(
+  prob_covs, ranger_model, fun = fun, na.rm = TRUE,
+  filename = prob_path, overwrite = TRUE, wopt = list(
+    steps = length(bs[[1]]), 
+    names = paste0(proj, "_cheatgrass_probability_model")))
 
-# Try this, safer for memory: 
-prob_path <- file.path(out_dir, "cheatgrass_presence_prob.tif")
-if(file.exists(prob_path)) unlink(prob_path)
-prob_predict = predict_spatial(
-  covs, best_learner, chunksize = 4096, predict_type = "prob", 
-  filename = prob_path)
-
-# ranger_model <- best_learner$model$classif.ranger$model 
-# fun <- function(model, ...) predict(model, ...)$predictions
-# prob_covs <- covs[[best_learner$model$importance$outtasklayout$id]] 
-# prob_predict <- terra::predict( 
-#   prob_covs, ranger_model, fun = fun, na.rm = TRUE) 
-# prob_predict <- writeRaster(   
-#   prob_predict[["TRUE."]],    
-#   filename = file.path(out_dir, "cheatgrass_presence_prob.tif"),   
-#   overwrite = TRUE)  
-
+# Reclassify into probability categories
 rcl <- matrix(c(
-  -Inf, 0, 1,  
-  0, 0.05, 2,  
-  0.05, 0.25, 3, 
-  0.25, 0.5, 4,  
-  0.5, Inf, 5), ncol = 3, byrow = TRUE) 
+  -Inf, 0.10, 1,  
+  0.10, 0.40, 2,  
+  0.40, 0.60, 3, 
+  0.60, 0.90, 4,  
+  0.90, Inf, 5), ncol = 3, byrow = TRUE) 
 cls <- data.frame(  
   id = 1:5,   
-  class = c("Free (0%)", "Trace (1-5%)", "Light Infestation (5-25%)",   
-            "Mild Infestation (25-50%)", "Cheatgrass Dominated (50-100%)"),  
+  class = c("Very unlikely to occur (0-10%)", 
+            "Unlikely to occur (11-40%)", 
+            "May occur about half of the time (41-60%)",   
+            "Likely to occur (61-90%)", "Very likely to occur (91-100%)"),  
   col = c("green", "deepskyblue", "yellow", "orange", "red"))  
 
 prob_classes <- classify(prob_predict, rcl) 
 levels(prob_classes) <- cls[, 1:2] 
 coltab(prob_classes) <- cls[, c(1, 3)] 
 prob_classes <- writeRaster(prob_classes, file.path(   
-  out_dir, "cheatgrass_prob_class.tif"), overwrite = TRUE) 
+  out_dir, paste0(proj, "_cheatgrass_probability_model_classified.tif")), 
+  overwrite = TRUE, datatype = "INT1U")
+
+saveRDS(ranger_model, file.path(
+  out_dir, paste0(proj, "_cheatgrass_probability_model.rds")))
 
 ```
 
@@ -207,69 +232,64 @@ prob_classes <- writeRaster(prob_classes, file.path(
 
 ```{r}
 
-tsk_cover <- as_task_regr_st(cheat_cover, target = "cover")  
-
-# Regression correlation filter 
-# cor_flt = flt("correlation") 
-# cor_flt$calculate(tsk_cover_ng) 
-# cor_dt <- as.data.table(cor_flt) 
-# cor_dt <- cor_dt[score >= 0.1, ]$feature 
-# tsk_cover$select(cor_dt)   
+tsk_cover <- as_task_regr_st(cheat_cover, target = "cover")
+tsk_cover$set_col_roles("block", remove_from = "feature")
 
 # Create the learner for feature filtering
-cover_lrn_filter = lrn("regr.ranger", importance = "impurity",            
-                       predict_type = "response",                 
-                       num.trees = to_tune(500, 500))  
+cover_lrn_filter = lrn("regr.ranger", importance = "impurity", 
+                       predict_type = "response")  
 
-# Create the "auto-tuner" for feature filtering (only used to simplify resampling)
-cover_at_filter <- auto_tuner(  
-  tuner = tnr("grid_search"),  
-  learner = cover_lrn_filter,   
-  terminator = trm("none"),  
-  measure = msr("oob_error"),  
-  resampling = rsmp("loo"), # leave one out resampling, should find most accurate feature importance   
-  store_models = TRUE 
-)
+plan(multisession, workers = availableCores() %/% 4)
+cover_rr_filter <- resample(
+  tsk_cover, cover_lrn_filter, rsmp("loo"), store_models = TRUE)
+plan(sequential)
 
-# Train the auto tuned model so that we get the best order of features to be 
-# used downstream 
-cover_at_filter$train(tsk_cover)  
+# spoof (aggregate) the importance values
+cover_rr_learners <- cover_rr_filter_results$learner
+cover_rr_imps <- as.data.frame(
+  sapply(cover_rr_learners, function(x) x$importance()))
+cover_rr_imps_vals <- sort(rowSums(cover_rr_imps), decreasing = TRUE)
+cover_rr_filter_results <- as.data.table(cover_rr_filter$score(msr("oob_error")))
+cover_best_filter_id <- which.min(cover_rr_filter_results$oob_error) 
+cover_filter_learner <- cover_rr_filter$learners[[cover_best_filter_id]]$base_learner()
+cover_filter_learner$model$variable.importance <- cover_rr_imps_vals
 
 # Place the best resulting learner into a filtering pipeop 
 cover_po_filter = po(
-  "filter", filter = flt("importance", learner = cover_at_filter$learner), 
-  filter.nfeat = to_tune(1, tsk_cover$ncol - 1)) 
+  "filter", filter = flt("importance", learner = cover_filter_learner), 
+  filter.nfeat = to_tune(1, length(tsk_cover$feature_names)))
 
 # Next, create a learner pipeop that will tune the hyperparameters 
 cover_lrn_tune = lrn("regr.ranger", importance = "impurity",      
                      predict_type = "response",                
                      num.trees = to_tune(100, 2000),             
-                     mtry = to_tune(1, tsk_cover$ncol - 1))  
+                     mtry = to_tune(1, length(tsk_cover$feature_names)))  
 cover_po_lrn = po("learner", cover_lrn_tune)  
 
 # Create the graph learner object that will combine these 
 cover_graph = as_learner(cover_po_filter %>>% cover_po_lrn)  
 
-# Create the tuning design grid - I figured out how to tune across all mtry # values (yay!) 
-cover_design <- expand.grid(importance.filter.nfeat = (tsk_cover$ncol - 1):4,   
-                            regr.ranger.num.trees = c(500, 1000, 2000),          
-                            regr.ranger.mtry = c(2, 6, 13, 27, 54, 108)) %>%   
-  dplyr::filter(regr.ranger.mtry <= importance.filter.nfeat)  
+# Create the tuning design grid - I figured out how to tune across all mtry 
+# values (yay!) 
+cover_design <- expand.grid(
+  importance.filter.nfeat = (length(tsk_cover$feature_names)):4,   
+  regr.ranger.num.trees = c(500, 1000, 2000),          
+  regr.ranger.mtry = length(tsk_cover$feature_names):1) %>%   
+  dplyr::filter(regr.ranger.mtry <= importance.filter.nfeat)
 cover_tn <- tnr("design_points", design = as.data.table(cover_design))  
 
 # Create the auto-tuner object 
 cover_at <- auto_tuner(  
   tuner = cover_tn,   
   learner = cover_graph,  
-  resampling = rsmp("cv", folds = 4),  
-  measure = msr("regr.mse"),   
-  terminator = trm("none") 
-)
+  resampling = rsmp("cv", folds = 5),  
+  measure = msr("regr.rmse"),   
+  terminator = trm("none"))
 
 # Runs both outer and inner loops in parallel 
 plan(list(  
   tweak(multisession, workers = availableCores() %/% 4),   
-  tweak(multisession, workers = I(4))    # <= force 4 workers 
+  tweak(multisession, workers = I(4))
 ))
 cover_rr <- mlr3::resample(
   tsk_cover, cover_at, rsmp("spcv_coords", folds = 8), store_models = TRUE) 
@@ -283,57 +303,55 @@ cover_outer_learners = lapply(cover_data$learner, "[[", "learner")
 
 # From the same object, extract the table of tuning results which can be viewed 
 # and queried 
-cover_outer_results = as.data.table(cover_rr$score(msr("regr.mse")))  
+cover_outer_results = as.data.table(cover_rr$score(msr("regr.rmse")))  
 
-# Now, from the outer learners, extract the one with the lowest binary Brier
-# score. Note that if the data is imbalanced, we should probably evaluate 
-# models using the area under the precision recall ROC curve (classif.prauc) 
-# according to the documentation 
-cover_best_id <- which.min(cover_outer_results$regr.mse) 
-cover_best_learner <- cover_outer_learners[[cover_best_id]] 
-cover_best_tune <- cover_data$learner[[cover_best_id]]$tuning_result[, 1:3]
-cover_best_param_set <- cover_best_learner$param_set  
+# Now, from the outer learners, extract the one with the lowest mean absolute
+# error score.
+cover_best_id <- which.min(cover_outer_results$regr.rmse) 
+cover_best_learner <- cover_outer_learners[[cover_best_id]]$base_learner()
+cover_best_tune <- extract_inner_tuning_results(cover_rr)[cover_best_id, 2:4]
+cover_best_param_set <- cover_best_learner$param_set
+cover_best_varimp <- cover_best_learner$importance()
+vip(cover_best_learner, num_features = length(cover_best_varimp))
 
-# If interested in the aggregated results of the inner tuning, or interested in 
-# looking at the results of each model run, you can use this code here to do so 
-# archives = extract_inner_tuning_archives(cover_rr) 
-# inner_learners = mlr3misc::map(archives$resample_result, "learners") 
-# using the best learner, generate a map prediction from the predictor rasters
+# Get some model results:
+cover_best_agg_score <- cover_rr$aggregate(msr("regr.rmse"))
+cover_ml_prediction <- cover_rr$prediction()
+cover_mod_oob <- sqrt(cover_best_learner$model$prediction.error)
 
-# Set the num.threads value to use all cores
-cover_best_learner$param_set$values$regr.ranger.num.threads <- availableCores()
-# cover_best_learner$parallel_predict <- FALSE
-# plan(sequential)
+# Predict model, same way as with probability modelling
+cover_ranger_model <- cover_best_learner$model
+cover_fun <- function(model, ...) predict(model, ...)$predictions
+cover_path <- file.path(out_dir, paste0(proj, "_cheatgrass_cover.tif"))
+cover_covs <- covs[[names(cover_ranger_model$variable.importance)]]
+cover_bs <- mlr3spatial:::block_size(cover_covs, chunksize = 1500)
+cover_predict <- terra::predict(
+  cover_covs, cover_ranger_model, fun = cover_fun, na.rm = TRUE,
+  filename = cover_path, overwrite = TRUE, wopt = list(
+    steps = length(cover_bs[[1]]), 
+    names = paste0(proj, "_cheatgrass_cover_model")))
 
-# Try this, safer for memory: 
-cover_path <- file.path(out_dir, "cheatgrass_cover.tif")
-if(file.exists(cover_path)) unlink(cover_path)
-cover_predict = predict_spatial(
-  covs, cover_best_learner, chunksize = 4096, predict_type = "response", 
-  filename = cover_path) 
-
-# cover_model <- cover_best_learner$model$regr.ranger$model 
-# fun <- function(model, ...) predict(model, ...)$predictions 
-# cover_predict <- terra::predict(  
-#   cover_covs, cover_model, fun = fun, na.rm = TRUE,  
-#   filename = cover_path, overwrite = TRUE)  
-
-rcl <- matrix(c(   
+# Reclassify into cover classes based on existing cover model
+cover_rcl <- matrix(c(   
   -Inf, 1, 1,
   1, 5, 2,
   5, 25, 3,  
   25, 50, 4,
   50, Inf, 5), ncol = 3, byrow = TRUE) 
-cls <- data.frame(  
+cover_cls <- data.frame(  
   id = 1:5,    
   class = c("Free (0%)", "Trace (1-5%)", "Light Infestation (5-25%)",     
             "Mild Infestation (25-50%)", "Cheatgrass Dominated (50-100%)"),   
   col = c("green", "deepskyblue", "yellow", "orange", "red"))  
-cover_classes <- classify(cover_predict, rcl) 
-levels(cover_classes) <- cls[, 1:2] 
-coltab(cover_classes) <- cls[, c(1, 3)] 
+cover_classes <- classify(cover_predict, cover_rcl) 
+levels(cover_classes) <- cover_cls[, 1:2] 
+coltab(cover_classes) <- cover_cls[, c(1, 3)] 
 cover_classes <- writeRaster(cover_classes, file.path(   
-  out_dir, "cheatgrass_cover_class.tif"), overwrite = TRUE)
+  out_dir, paste0(proj, "_cheatgrass_cover_model_classified.tif")),
+  overwrite = TRUE, datatype = "INT1U")
+
+saveRDS(cover_ranger_model, file.path(
+  out_dir, paste0(proj, "_cheatgrass_cover_model.rds")))
 
 ```
 
@@ -341,7 +359,9 @@ cover_classes <- writeRaster(cover_classes, file.path(
 
 ```{r}
 
-tsk_bal_cc <- as_task_classif(st_drop_geometry(cheat_cc), target = "cover_class")
+tsk_bal_cc <- as_task_classif(
+  st_drop_geometry(cheat_cc), target = "cover_class", id = "bal_cc_aspatial")
+tsk_bal_cc$set_col_roles("block", remove_from = "feature")
 
 # SMOTE can only work on numeric data columns, not integer. First, pipe the 
 # integer to numeric function across the data, then SMOTE a few times to get
@@ -354,9 +374,9 @@ int_cols <- tsk_bal_cc$feature_types[type == "integer"]$id
 gr_smote =
   po("colapply", id = "int_to_num",
     applicator = as.numeric, affect_columns = selector_name(int_cols)) %>>%
-  po("smote", id = "smote1", dup_size = 10) %>>%
+  po("smote", id = "smote1", dup_size = 19) %>>%
   po("smote", id = "smote2", dup_size = 10) %>>%
-  po("smote", id = "smote3", dup_size = 3) %>>%
+  po("smote", id = "smote3", dup_size = 2) %>>%
   po("smote", id = "smote4", dup_size = 2) %>>%
   po("classbalancing", id = "classbalance", ratio = 0.5, reference = "major",
      adjust = "major", shuffle = TRUE) %>>%
@@ -371,271 +391,222 @@ tsk_bal_cc <- as_task_classif(
   target = "cover_class")
 table(tsk_bal_cc$data(cols = "cover_class"))
 
-bal_cc_lrn_tune = lrn("classif.ranger", importance = "impurity", 
-                      predict_type = "response",
-                      num.trees = to_tune(500, 500))
+# Create the learner for feature filtering
+bal_cc_lrn_filter = lrn("classif.ranger", importance = "impurity", 
+                        predict_type = "response")  
 
-# Create the "auto-tuner" for feature filtering (only used to simplify resampling)
-bal_cc_at_filter <- auto_tuner(  
-  tuner = tnr("grid_search"),  
-  learner = bal_cc_lrn_tune,   
-  terminator = trm("none"),  
-  measure = msr("oob_error"),  
-  resampling = rsmp("loo"), # leave one out resampling, should find most accurate feature importance   
-  store_models = TRUE 
-)
+plan(multisession, workers = availableCores() %/% 4)
+bal_cc_rr_filter <- resample(tsk_bal_cc, bal_cc_lrn_filter, rsmp("loo"), store_models = TRUE)
+plan(sequential)
 
-# Train the auto tuned model so that we get the best order of features to be 
-# used downstream 
-bal_cc_at_filter$train(tsk_bal_cc) 
+# spoof (aggregate) the importance values
+bal_cc_rr_learners <- bal_cc_rr_filter_results$learner
+bal_cc_rr_imps <- as.data.frame(
+  sapply(bal_cc_rr_learners, function(x) x$importance()))
+bal_cc_rr_imps_vals <- sort(rowSums(bal_cc_rr_imps), decreasing = TRUE)
+bal_cc_rr_filter_results <- as.data.table(
+  bal_cc_rr_filter$score(msr("oob_error")))
+bal_cc_best_filter_id <- which.min(bal_cc_rr_filter_results$oob_error) 
+bal_cc_filter_learner <- bal_cc_rr_filter$learners[[bal_cc_best_filter_id]]$base_learner()
+bal_cc_filter_learner$model$variable.importance <- bal_cc_rr_imps_vals
 
 # Place the best resulting learner into a filtering pipeop 
-po_filter = po(
-  "filter", filter = flt("importance", learner = bal_cc_at_filter$learner),
-  filter.nfeat = to_tune(1, tsk_bal_cc$ncol - 1))  
+bal_cc_po_filter = po(
+  "filter", filter = flt("importance", learner = bal_cc_filter_learner),
+  filter.nfeat = to_tune(1, length(tsk_bal_cc$feature_names)))  
 
 # Next, create a learner pipeop that will tune the hyperparameters 
 bal_cc_lrn_tune = lrn("classif.ranger", importance = "impurity",        
                predict_type = "response",            
                num.trees = to_tune(100, 2000),    
-               mtry = to_tune(1, tsk_bal_cc$ncol - 1))  
-po_lrn = po("learner", bal_cc_lrn_tune) 
+               mtry = to_tune(1, length(tsk_bal_cc$feature_names)))  
+bal_cc_po_lrn = po("learner", bal_cc_lrn_tune) 
 
 # Create the graph learner object that will combine these 
-bal_cc_graph = as_learner(po_filter %>>% po_lrn)  
+bal_cc_graph = as_learner(bal_cc_po_filter %>>% bal_cc_po_lrn)  
 
 # Create the tuning design grid - I figured out how to tune across all mtry 
 # values (yay!) 
-design <- expand.grid(importance.filter.nfeat = (tsk_pres$ncol - 1):4,    
-                      classif.ranger.num.trees = c(500, 1000, 2000), 
-                      classif.ranger.mtry = (tsk_pres$ncol - 1):1) %>%    
+bal_cc_design <- expand.grid(
+  importance.filter.nfeat = length(tsk_bal_cc$feature_names):4,    
+  classif.ranger.num.trees = c(500, 1000, 2000), 
+  classif.ranger.mtry = length(tsk_bal_cc$feature_names):1) %>%    
   dplyr::filter(classif.ranger.mtry <= importance.filter.nfeat) 
-tn <- tnr("design_points", design = as.data.table(design)) 
+bal_cc_tn <- tnr("design_points", design = as.data.table(bal_cc_design)) 
 
 # Create the auto-tuner object 
 bal_cc_at <- auto_tuner(  
-  tuner = tn,  
+  tuner = bal_cc_tn,  
   learner = bal_cc_graph,  
-  resampling = rsmp("cv", folds = 4),   
-  measure = msr("classif.ce"),   
+  resampling = rsmp("cv", folds = 5),   
+  measure = msr("classif.acc"),   
   terminator = trm("none") 
-)  
-
-# Runs both outer and inner loops in parallel 
-plan(list(   
-  tweak(multisession, workers = availableCores() %/% 4),  
-  tweak(multisession, workers = I(4))    # <= force 4 workers
-)) 
-bal_cc_rr <- mlr3::resample(
-  tsk_bal_cc, at, rsmp("cv", folds = 8), store_models = TRUE) 
-plan(sequential) 
-
-# Get the best model for prediction: first, get all outer learners. These would
-# have the most data used for training and testing and will produce the most
-# reliable results
-bal_cc_data = as.data.table(bal_cc_rr)
-bal_cc_outer_learners = bal_cc_data$learner
-
-# From the same object, extract the table of tuning results which can be viewed
-# and queried
-bal_cc_outer_results = as.data.table(bal_cc_rr$score(msr("oob_error")))
-
-# Now, from the outer learners, extract the one with the lowest binary Brier
-# score. Note that if the data is imbalanced, we should probably evaluate 
-# models using the area under the precision recall ROC curve (classif.prauc)
-# according to the documentation
-bal_cc_best_id <- which.min(bal_cc_outer_results$oob_error)
-bal_cc_best_learner <- bal_cc_outer_learners[[bal_cc_best_id]]
-bal_cc_best_tune <- bal_cc_data$learner[[bal_cc_best_id]]$tuning_result[, 1:3]
-bal_cc_best_param_set <- bal_cc_best_learner$learner$param_set
-
-# If interested in the aggregated results of the inner tuning, or interested in
-# looking at the results of each model run, you can use this code here to do so
-# archives = extract_inner_tuning_archives(m3m_cover_rr)
-# inner_learners = mlr3misc::map(archives$resample_result, "learners")
-
-# using the best learner, generate a map prediction from the predictor rasters
-# Set the num.threads value to use all cores
-bal_cc_best_learner$learner$param_set$values$classif.ranger.num.threads <- availableCores()
-
-
-cc_path <- file.path(out_dir, "cheatgrass_cover_class.tif")
-if(file.exists(cc_path)) unlink(cc_path)
-bal_cc_predict = predict_spatial(
-  covs, bal_cc_best_learner$learner, predict_type = "response", chunksize = 4096,
-  filename = cc_path)
-# m3m_predict = predict_spatial(m3m_prob_covs, cover_best_learner, predict_type = "prob")
-
-cover_ranger_model <- cover_best_learner$model
-fun <- function(model, ...) predict(model, ...)$predictions
-altum_cover_covs <- altum_covs[[names(cover_best_learner$model$variable.importance)]]
-m3m_cover_covs <- m3m_covs[[names(cover_best_learner$model$variable.importance)]]
-altum_cover_predict <- terra::predict(
-  altum_cover_covs, cover_ranger_model, fun = fun, na.rm = TRUE,
-  filename = "C:/Users/mcoghill/SynologyDrive/Cheatgrass/Model Outputs/Altum_update_cover2.tif",
-  overwrite = TRUE)
-m3m_cover_predict <- terra::predict(
-  m3m_cover_covs, cover_ranger_model, fun = fun, na.rm = TRUE,
-  filename = "C:/Users/mcoghill/SynologyDrive/Cheatgrass/Model Outputs/M3M_update_cover2.tif",
-  overwrite = TRUE)
-
-# Check for data type here (integer vs. numeric)
-
-cls <- data.frame(
-  id = 1:5,
-  class = c("Free (0%)", "Trace (1-5%)", "Light Infestation (5-25%)",
-            "Mild Infestation (25-50%)", "Cheatgrass Dominated (50-100%)"),
-  col = c("green", "deepskyblue", "yellow", "orange", "red"))
-
-levels(cc_predict_merge) <- cls[, 1:2]
-coltab(cc_predict_merge) <- cls[, c(1, 3)]
-cc_predict_merge <- writeRaster(
-  cc_predict_merge,
-  "C:/Users/mcoghill/SynologyDrive/Cheatgrass/Model Outputs/Kamloops_Lake_cover_class4_color.tif",
-  overwrite = TRUE)
-
+)
+bal_cc_at$id <- "bal_cc_tuner"
 
 ```
 
-Cover Classes
+## Cover Classes, spatial CV
+
+Now, create similar objects using the original imbalanced data.
 
 ```{r}
 
-tsk_cc <- as_task_classif_st(
-  cov_extract, target = "cover_class")
-tsk_cc$select(grep("camera|cover|presence", tsk_cc$feature_names, 
-                     invert = TRUE, value = TRUE))
-
-tsk_cc_ng <- as_task_classif(
-  st_drop_geometry(cov_extract), target = "cover_class")
-tsk_cc_ng$select(grep("camera|cover|presence", tsk_cc_ng$feature_names, 
-                     invert = TRUE, value = TRUE))
-
-
-# poin <- list(tsk_pres$clone())
-# po_scale <- po("scale")
-# poout <- po_scale$train(poin)
-# poout <- po_scale$predict(poin)[[1]]
-
-# Classification correlation filter (finds features that are correlated with 
-# the presence data, i.e.: more explanatory variables)
-# cor_fflt = flt("find_correlation")
-# cor_fflt$calculate(tsk_pres_ng)
-# cor_fdt <- as.data.table(cor_fflt)
-# cor_fdt <- cor_fdt[score >= 0.1, ]$feature
-# tsk_pres$select(cor_fdt)
-# altum_prob_covs <- altum_covs[[cor_fdt]]
-# m3m_prob_covs <- m3m_covs[[cor_fdt]]
+tsk_unbal_cc <- as_task_classif_st(
+  cheat_cc, target = "cover_class", id = "unbal_cc_spatial")
+tsk_unbal_cc$set_col_roles("block", remove_from = "feature")
 
 # Create the learner for feature filtering
-cc_lrn_filter = lrn("classif.ranger", importance = "impurity", 
-                 predict_type = "response",
-                 num.trees = to_tune(500, 500))
+unbal_cc_lrn_filter = lrn("classif.ranger", importance = "impurity", 
+                        predict_type = "response")  
 
-# Create the "auto-tuner" for feature filtering (only used to simplify resampling)
-cc_at_filter <- auto_tuner(
-  tuner = tnr("grid_search"),
-  learner = cc_lrn_filter,
-  terminator = trm("none"),
-  measure = msr("oob_error"),
-  resampling = rsmp("loo"), # leave one out resampling, should find most accurate feature importance
-  store_models = TRUE
-)
+plan(multisession, workers = availableCores() %/% 4)
+unbal_cc_rr_filter <- resample(
+  tsk_unbal_cc, unbal_cc_lrn_filter, rsmp("loo"), store_models = TRUE)
+plan(sequential)
 
-# Train the auto tuned model so that we get the best order of features to be
-# used downstream
-cc_at_filter$train(tsk_cc)
+# spoof (aggregate) the importance values
+unbal_cc_rr_learners <- unbal_cc_rr_filter_results$learner
+unbal_cc_rr_imps <- as.data.frame(
+  sapply(unbal_cc_rr_learners, function(x) x$importance()))
+unbal_cc_rr_imps_vals <- sort(rowSums(unbal_cc_rr_imps), decreasing = TRUE)
+unbal_cc_rr_filter_results <- as.data.table(
+  unbal_cc_rr_filter$score(msr("oob_error")))
+unbal_cc_best_filter_id <- which.min(unbal_cc_rr_filter_results$oob_error) 
+unbal_cc_filter_learner <- unbal_cc_rr_filter$learners[[unbal_cc_best_filter_id]]$base_learner()
+unbal_cc_filter_learner$model$variable.importance <- unbal_cc_rr_imps_vals
 
 # Place the best resulting learner into a filtering pipeop
-cc_po_filter = po("filter", filter = flt("importance", learner = cc_at_filter$learner),
-               filter.nfeat = to_tune(1, tsk_cc$ncol - 1))
+unbal_cc_po_filter = po(
+  "filter", filter = flt("importance", learner = unbal_cc_filter_learner),
+  filter.nfeat = to_tune(1, length(tsk_unbal_cc$feature_names)))
 
 # Next, create a learner pipeop that will tune the hyperparameters
-cc_lrn_tune = lrn("classif.ranger", importance = "impurity", 
+unbal_cc_lrn_tune = lrn("classif.ranger", importance = "impurity", 
                 predict_type = "response",
                 num.trees = to_tune(100, 2000),
-                mtry = to_tune(1, tsk_cc$ncol - 1))
+                mtry = to_tune(1, length(tsk_unbal_cc$feature_names)))
 
-cc_po_lrn = po("learner", cc_lrn_tune)
+unbal_cc_po_lrn = po("learner", unbal_cc_lrn_tune)
 
 # Create the graph learner object that will combine these
-cc_graph = as_learner(cc_po_filter %>>% cc_po_lrn)
+unbal_cc_graph = as_learner(unbal_cc_po_filter %>>% unbal_cc_po_lrn)
 
 # Create the tuning design grid - I figured out how to tune across all mtry
 # values (yay!)
-cc_design <- expand.grid(importance.filter.nfeat = (tsk_cc$ncol - 1):4,
-                      classif.ranger.num.trees = c(500, 1000, 2000),
-                      classif.ranger.mtry = (tsk_cc$ncol - 1):1) %>% 
+unbal_cc_design <- expand.grid(
+  importance.filter.nfeat = length(tsk_unbal_cc$feature_names):4,
+  classif.ranger.num.trees = c(500, 1000, 2000),
+  classif.ranger.mtry = length(tsk_unbal_cc$feature_names):1) %>% 
   dplyr::filter(classif.ranger.mtry <= importance.filter.nfeat)
-
-cc_tn <- tnr("design_points", design = as.data.table(cc_design))
+unbal_cc_tn <- tnr("design_points", design = as.data.table(unbal_cc_design))
 
 # Create the auto-tuner object
-cc_at <- auto_tuner(
-  tuner = cc_tn,
-  learner = cc_graph,
-  resampling = rsmp("cv", folds = 4),
-  measure = msr("classif.ce"),
+unbal_cc_at <- auto_tuner(
+  tuner = unbal_cc_tn,
+  learner = unbal_cc_graph,
+  resampling = rsmp("cv", folds = 5),
+  measure = msr("classif.bacc"),
   terminator = trm("none")
 )
+unbal_cc_at$id <- "unbal_cc_tuner"
+
+```
+
+### Benchmark cover class models
+
+True benchmarking doesn't work because of differing task types, but I can essentially create my own benchmark here where I look at the results and make a decision based on model scoring for which cover class model will be produced. Notes:
+
+-   classif.acc is used for balanced datasets while classif.bacc is used for unbalanced datasets
+
+-   Class balancing is sure to have a positive model impact, though the map might not really be true
+
+-   A fair comparison would be between the class balanced dataset (non-spatial) and an imbalanced dataset that is also non-spatial; however, this takes time to produce and is not expected to outperform the balanced dataset.
+
+```{r}
 
 # Runs both outer and inner loops in parallel
 plan(list(
   tweak(multisession, workers = availableCores() %/% 4),
-  tweak(multisession, workers = I(4))    # <= force 4 workers
+  tweak(multisession, workers = I(4))
 ))
-cc_rr <- mlr3::resample(tsk_cc, cc_at, rsmp("spcv_coords", folds = 8), store_models = TRUE)
+
+# Can't evaluate each of these in a benchmark because of differing task types,
+# so must evaluate manually
+bal_cc_rr <- resample(tsk_bal_cc, bal_cc_at, rsmp("cv", folds = 8),
+                      store_models = TRUE)
+unbal_cc_rr <- resample(tsk_unbal_cc, unbal_cc_at, rsmp("spcv_coords", folds = 8),
+                        store_models = TRUE)
+# unbal_cc_rr_ng <- resample(tsk_unbal_cc, unbal_cc_at, rsmp("cv", folds = 8),
+#                            store_models = TRUE)
 plan(sequential)
 
-# Get the best model for prediction: first, get all outer learners. These would
-# have the most data used for training and testing and will produce the most
-# reliable results
-cc_data = as.data.table(cc_rr)
-cc_outer_learners = lapply(cc_data$learner, "[[", "learner")
+# List all of the resample results together
+cc_rr_list <- list(bal_cc_rr, unbal_cc_rr, unbal_cc_rr_ng)
+cc_results <- as.data.frame(sapply(cc_rr_list, function(x) {
+  cc_data = as.data.table(x)
+  cc_outer_learners = lapply(cc_data$learner, "[[", "learner")
+  
+  # From the same object, extract the table of tuning results which can be 
+  # viewed and queried
+  msr <- ifelse(x$task_type == "classif", "classif.acc", "classif.bacc")
+  cc_outer_results = as.data.table(x$score(msr(msr)))
+  
+  # Now, from the outer learners, extract the one with the highest (balanced)
+  # accuracy score. 
+  cc_best_id <- which.min(cc_outer_results[[msr]])
+  cc_best_learner <- cc_outer_learners[[cc_best_id]]$base_learner()
+  # cc_best_tune <- extract_inner_tuning_results(x)[cc_best_id, 2:4]
+  # cc_best_param_set <- cc_best_learner$param_set
+  # cc_best_varimp <- cc_best_learner$importance()
+  # 
+  # # Get some model results:
+  cc_best_agg_score <- x$aggregate(msr(msr))
+  # cc_ml_prediction <- x$prediction()
+  # cc_ml_confusion <- cc_ml_prediction$confusion
+  # mod_confusion <- x$predictions()[[cc_best_id]]$confusion
+  mod_oob <- cc_best_learner$model$prediction.error
+  return(list(aggregated_score = cc_best_agg_score,
+              outer_fold_msr = max(cc_outer_results[[msr]]),
+              model_oob = mod_oob))
+}))
 
-# From the same object, extract the table of tuning results which can be viewed
-# and queried
-cc_outer_results = as.data.table(cc_rr$score(msr("classif.ce")))
+cc_results_an <- (unlist(cc_results[1, ]) + unlist(cc_results[2, ]) - 
+  unlist(cc_results[3, ])) %>% unname()
 
-# Now, from the outer learners, extract the one with the lowest binary Brier
-# score. Note that if the data is imbalanced, we should probably evaluate 
-# models using the area under the precision recall ROC curve (classif.prauc)
-# according to the documentation
-cc_best_id <- which.min(cc_outer_results$classif.ce)
-cc_best_learner <- cc_outer_learners[[cc_best_id]]
-cc_best_tune <- cc_data$learner[[cc_best_id]]$tuning_result[, 1:3]
+# Best results seem to be with the balanced dataset, so choose that moving forward
+cc_rr <- cc_rr_list[[which.max(cc_results_an)]]$clone()
+msr <- ifelse(cc_rr$task_type == "classif", "classif.acc", "classif.bacc")
+cc_outer_results = as.data.table(cc_rr$score(msr(msr)))
+
+# Now, from the outer learners, extract the one with the highest (balanced)
+# accuracy score. 
+cc_best_id <- which.min(cc_outer_results[[msr]])
+cc_best_learner <- cc_outer_learners[[cc_best_id]]$base_learner()
+cc_best_tune <- extract_inner_tuning_results(cc_rr)[cc_best_id, 2:4]
 cc_best_param_set <- cc_best_learner$param_set
+cc_best_varimp <- cc_best_learner$importance()
 
-# If interested in the aggregated results of the inner tuning, or interested in
-# looking at the results of each model run, you can use this code here to do so
-# archives = extract_inner_tuning_archives(rr)
-# inner_learners = mlr3misc::map(archives$resample_result, "learners")
+# Get some model results:
+cc_best_agg_score <- cc_rr$aggregate(msr(msr))
+cc_ml_prediction <- cc_rr$prediction()
+cc_ml_confusion <- cc_ml_prediction$confusion
+mod_confusion <- cc_rr$predictions()[[cc_best_id]]$confusion
+mod_oob <- cc_best_learner$model$prediction.error
 
-# using the best learner, generate a map prediction from the predictor rasters
-# Set the num.threads value to use all cores
-cc_best_learner$param_set$values$classif.ranger.num.threads <- availableCores()
-# altum_predict = predict_spatial(altum_prob_covs, best_learner, predict_type = "prob")
-# m3m_predict = predict_spatial(m3m_prob_covs, best_learner, predict_type = "prob")
-
-cc_ranger_model <- cc_best_learner$model$classif.ranger$model
-fun <- function(model, ...) predict(model, ...)$predictions
-cc_altum_prob_covs <- altum_covs[[cc_best_learner$model$importance$outtasklayout$id]]
-cc_m3m_prob_covs <- m3m_covs[[cc_best_learner$model$importance$outtasklayout$id]]
-cc_altum_predict <- terra::predict(
-  cc_altum_prob_covs, cc_ranger_model, fun = fun, na.rm = TRUE,
-  filename = "C:/Users/mcoghill/SynologyDrive/Cheatgrass/Model Outputs/Altum_update_cover_class.tif",
-  overwrite = TRUE)
-cc_m3m_predict <- terra::predict(
-  cc_m3m_prob_covs, cc_ranger_model, fun = fun, na.rm = TRUE,
-  filename = "C:/Users/mcoghill/SynologyDrive/Cheatgrass/Model Outputs/M3M_update_cover_class.tif",
-  overwrite = TRUE)
-
-# Check for data type here (integer vs. numeric)
-cc_predict_merge <- mosaic(
-  cc_altum_predict, cc_m3m_predict, fun = "modal",
-  filename = "C:/Users/mcoghill/SynologyDrive/Cheatgrass/Model Outputs/Kamloops_Lake_cover_class3.tif",
-  overwrite = TRUE)
-
+# Predict model
+cc_path <- file.path(out_dir, paste0(proj, "_cheatgrass_cover_class_model.tif"))
+cc_ranger_model <- cc_best_learner$model
+cc_fun <- function(model, ...) predict(model, ...)$predictions
+cc_covs <- covs[[names(cc_ranger_model$variable.importance)]]
+cc_bs <- mlr3spatial:::block_size(cc_covs, chunksize = 1500)
+cc_predict <- terra::predict(
+  cc_covs, cc_ranger_model, fun = cc_fun, na.rm = TRUE,
+  filename = file.path(tempdir(), basename(cc_path)), 
+  overwrite = TRUE, wopt = list(
+    steps = length(cc_bs[[1]]), 
+    names = paste0(proj, "_cheatgrass_cover_class_model"),
+    datatype = "INT1U"))
 
 cls <- data.frame(
   id = 1:5,
@@ -643,11 +614,20 @@ cls <- data.frame(
             "Mild Infestation (25-50%)", "Cheatgrass Dominated (50-100%)"),
   col = c("green", "deepskyblue", "yellow", "orange", "red"))
 
-levels(cc_predict_merge) <- cls[, 1:2]
-coltab(cc_predict_merge) <- cls[, c(1, 3)]
-cc_predict_merge <- writeRaster(
-  cc_predict_merge,
-  "C:/Users/mcoghill/SynologyDrive/Cheatgrass/Model Outputs/Kamloops_Lake_Prob_Class.tif",
-  overwrite = TRUE)
+coltab(cc_predict) <- cls[, c(1, 3)]
+cc_predict <- writeRaster(
+  cc_predict, cc_path, overwrite = TRUE, datatype = "INT1U")
+
+saveRDS(cc_ranger_model, file.path(
+  out_dir, paste0(proj, "_cheatgrass_cover_class_model.rds")))
+
+```
+
+## Modelling results
+
+Now, place all modelling results into easily readable CSV files and images.
+
+```{r}
+
 
 ```
