@@ -45,6 +45,9 @@ if(serv_conn == "SFTP") {
 # Get the field data files (note: looking to move this to a different folder 
 # at a later date, so change this as needed):
 proj <- "South Thompson"
+kml_dir <- file.path(
+  serv, 
+  "KML Flight Areas/South Thompson Project Area/overall area")
 fd_dir <- file.path(serv, "Vegetation Data - 2024")
 air_photo_p <- file.path(fd_dir, "Air Photo Interpretation.gpkg")
 f_data_p <- file.path(fd_dir, "Veg Survey data - 2024.xlsx")
@@ -53,7 +56,8 @@ f_pts_p <- list.files(file.path(fd_dir, "Avenza Exports"),
 
 air_photo <- st_read(air_photo_p, quiet = TRUE) %>% 
   janitor::clean_names() %>% 
-  select(-notes)
+  select(-notes) %>% 
+  st_set_agr("constant")
 
 f_data <- read_excel(f_data_p, skip = 2, col_types = "guess") %>% 
   janitor::clean_names() %>% 
@@ -152,9 +156,79 @@ missing_fdata <- filter(fd, is.na(cover)) %>%
 write.csv(missing_fdata, file.path(fd_dir, "missing.csv"), row.names = FALSE)
 
 # Create a single large dataset for raster extraction in next chunk
+# Set block to be the from the flight area polygons instead
+sample_blocks <- file.path(kml_dir, "South Thompson Project Area - 2024.kml")
+sample_polys <- st_read(sample_blocks, quiet = TRUE) %>% 
+  st_zm() %>% 
+  rename(block = Name) %>% 
+  select(block) %>% 
+  filter(!block %in% "South Thompson Project Area") %>% 
+  mutate(block = as.numeric(block)) %>% 
+  st_transform(st_crs(air_photo)) %>% 
+  st_set_agr("constant")
+
 fd_full <- rbind(
   fd %>% select(cover, presence) %>% filter(!is.na(cover)),
-  air_photo %>% mutate(cover = NA)) %>% vect()
+  air_photo %>% mutate(cover = NA)) %>% 
+  mutate(block = sample_polys$block[st_nearest_feature(., sample_polys)],
+         .before = cover) %>% 
+  arrange(block, presence, cover)
+
+# Ensure that each block has a minimum of 5 observations of one presence/absence:
+fd_check <- lapply(unique(fd_full$block), function(x) {
+  table(fd_full %>% 
+    filter(block == x) %>% 
+    pull(presence))
+}) %>% setNames(unique(fd_full$block))
+
+fd_check2 <- sapply(fd_check, function(x) {
+  !(length(x) == 2 && all(x >= 5))
+})
+
+fd_fix <- fd_full %>% 
+  filter(!block %in% as.numeric(names(fd_check2[fd_check2])))
+fd_unfull <- fd_full %>% 
+  filter(block %in% as.numeric(names(fd_check2[fd_check2])))
+while(any(fd_check2)) {
+  
+  fd_unfull <- fd_unfull %>% 
+    mutate(block = ifelse(block %in% as.numeric(names(fd_check2[fd_check2]))[-1],
+                          block - 1, block))
+  
+  fd_check <- lapply(unique(fd_unfull$block), function(x) {
+    table(fd_unfull %>% 
+            filter(block == x) %>% 
+            pull(presence))
+  }) %>% setNames(unique(fd_unfull$block))
+  
+  if(length(fd_check) == 0) {
+    fd_check2 <- FALSE
+  } else {
+    fd_check2 <- sapply(fd_check, function(x) {
+      !(length(x) == 2 && all(x >= 5))
+    })
+  }
+  
+  
+  
+  if(length(fd_check2) <= 3) {
+    fd_unfull$block <- as.numeric(names(fd_check)[1])
+  }
+    
+  fd_fix <- rbind(
+    fd_fix,
+    fd_unfull %>% filter(!block %in% as.numeric(names(fd_check2[fd_check2]))))
+  fd_unfull <- fd_unfull %>% 
+    filter(block %in% as.numeric(names(fd_check2[fd_check2])))
+}
+
+fd_check <- lapply(unique(fd_fix$block), function(x) {
+    table(fd_fix %>% 
+            filter(block == x) %>% 
+            pull(presence))
+}) %>% setNames(unique(fd_fix$block))
+
+fd_final <- vect(fd_fix)
 
 ```
 
@@ -182,8 +256,31 @@ covs_no_na <- global(covs, fun = "isNA") %>%
   pull(layer)
 covs <- covs[[covs_no_na]]
 
+# Determine which covariates are not highly correlated
+cormat <- layerCor(covs, "cor", maxcell = 1e+06)
+corr <- cormat$correlation
+
+# P-values tell us the likelihood that two variables are correlated
+cortest <- cor.mtest(corr)
+cm <- as.data.frame(cortest$p) %>% 
+  mutate(across(everything(), ~.x > 0.05))
+
+# only need the "top half" of the data for rowsums calculation
+for(x in 1:ncol(cm)) {
+  cm[x:nrow(cm), x] <- FALSE
+}
+cm$ncorrelated <- rowSums(cm)
+
+# Select variables that are at are not correlated with at
+# least half plus 1 of the other variables
+cm <- cm %>%
+  filter(ncorrelated <= (floor(nlyr(covs) / 2) + 1)) %>% 
+  rownames_to_column() %>% 
+  pull(rowname)
+covs <- covs[[cm]]
+
 # Perform data extraction
-cov_extract <- extract(covs, fd_full, bind = TRUE) %>% 
+cov_extract <- extract(covs, fd_final, bind = TRUE) %>% 
   na.omit(field = names(covs)) %>% 
   st_as_sf()
 
