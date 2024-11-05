@@ -13,7 +13,7 @@ First, load the libraries that will be used for this script.
 
 ```{r init, include=FALSE}
 
-ls <- c("tidyverse", "readxl", "terra", "sf")
+ls <- c("tidyverse", "readxl", "terra", "sf", "corrplot")
 
 invisible(suppressPackageStartupMessages(
   lapply(ls, library, character.only = TRUE)))
@@ -286,7 +286,10 @@ cov_extract <- extract(covs, fd_final, bind = TRUE) %>%
 
 # Separate datasets for the different models
 cheat_pres <- select(cov_extract, -cover)
-cheat_cover <- filter(cov_extract, !is.na(cover)) %>% select(-presence)
+cheat_cover <- cov_extract %>% 
+  mutate(cover = ifelse(!presence, 0, cover)) %>% 
+  filter(!is.na(cover)) %>% 
+  select(-presence)
 
 # Write outputs - these will get used in the next script.
 fd_out <- file.path(serv, "Modelling/Field Data", proj, paste0(
