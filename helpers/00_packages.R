@@ -4,7 +4,7 @@
 # CRAN packages
 ls <- c("tidyverse", "lidR", "sf", "sfheaders", "future.apply", "terra", 
   "data.table", "units", "rmapshaper", "lwgeom", "RCSF", "lme4", "devtools",
-  "RStoolbox", "mlr3verse", "mlr3spatial", "mlr3spatiotempcv", "mlr3benchmark",
+  "RStoolbox", "mlr3verse", "mlr3spatial", "mlr3spatiotempcv", "corrplot",
   "readxl", "vip", "ranger", "Rsagacmd")
 
 new_packages <- ls[!(ls %in% installed.packages()[, "Package"])]
