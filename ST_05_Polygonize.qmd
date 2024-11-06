@@ -1,0 +1,76 @@
+---
+title: "ST05_Polygonize"
+author: "Matthew Coghill"
+format: html
+editor: visual
+---
+
+## Polygonize
+
+This final script will take the classified rasters from the modelling and convert them into shapefiles for production. This script will tackle the "post-processing" of the maps using the R implementation of mapshaper, "rmapshaper". We begin with loading the required packages:
+
+```{r}
+
+ls <- c("terra", "sf", "rmapshaper")  
+invisible(suppressPackageStartupMessages(   
+  lapply(ls, library, character.only = TRUE))) 
+rm(ls)  
+
+# Set file access either over SFTP connection, Local LAN, or through the 
+# Synology Drive app (i.e.: "SFTP", "Local", "SynologyDrive", or whatever the
+# folder name is for your Synology Drive app location) 
+serv_conn <- "Synology" 
+
+```
+
+Now, we can define where the classified rasters are saved and then generate the shapefiles of each of the classified rasters.
+
+```{r}
+
+# Determine server directory method (change username if using SFTP connection) 
+if(serv_conn == "SFTP") {  
+  user <- "mcoghill"   
+  serv <- paste0("//", user, "@aurorauav.synology.me/Cheatgrass") 
+} else if(serv_conn == "Local") { 
+  serv <- "//AuroraNAS/Cheatgrass" 
+} else if(serv_conn == "Synology") {  
+  serv <- file.path(Sys.getenv("USERPROFILE"), "SynologyDrive/Cheatgrass") 
+} else serv <- serv_conn  
+
+# Get the field data files (note: looking to move this to a different folder 
+# at a later date, so change this as needed): 
+proj <- "South Thompson"  
+
+# Define input directory and shapefile directory for writing shapefiles to
+out_dir <- file.path(serv, "Modelling/Outputs", proj) 
+shp_dir <- file.path(out_dir, "Shapefiles")
+dir.create(shp_dir, showWarnings = FALSE)
+
+# Define input file names
+prob_classes <- file.path(
+  out_dir, paste0(proj, "_cheatgrass_probability_model_classified.tif"))
+cover_classes <- file.path(
+  out_dir, paste0(proj, "_cheatgrass_cover_model_classified.tif"))
+cc <- file.path(out_dir, paste0(proj, "_cheatgrass_cover_class_model.tif"))
+
+# Polygonize each classification raster in a loop
+poly_classes <- lapply(c(prob_classes, cover_classes, cc), function(x) {
+  
+  # Aggregate raster to 2.5m^2 for this to work (also for simpler output)
+  r_classes <- rast(x)
+  r_ag <- aggregate(r_classes, fact = 5, fun = "modal", na.rm = TRUE)
+  
+  # Convert to polygons and use the ms_simplify function to simplify the 
+  # polygon returned from above
+  poly_simple <- as.polygons(r_ag) |> 
+    st_as_sf() |> 
+    ms_simplify()
+  st_write(
+    poly_simple, file.path(shp_dir, gsub(".tif", ".shp", basename(x))),
+    quiet = TRUE, delete_dsn = TRUE)
+  return(poly_simple)
+})
+
+
+
+```
