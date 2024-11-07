@@ -9,7 +9,7 @@ editor: visual
 
 ```{r init, include=FALSE}
 
-ls <- c("tidyverse", "terra", "sf", "mlr3verse", "mlr3spatial", "mlr3benchmark",
+ls <- c("tidyverse", "terra", "sf", "mlr3verse", "mlr3spatial", "ranger",
         "mlr3spatiotempcv", "future", "vip")  
 invisible(suppressPackageStartupMessages(   
   lapply(ls, library, character.only = TRUE))) 
@@ -20,12 +20,12 @@ rm(ls)
 # folder name is for your Synology Drive app location) 
 serv_conn <- "Synology" 
 
-# Get memory in KB
-mem <- as.numeric(
-  system("awk '/MemTotal/ {print $2}' /proc/meminfo", intern = TRUE))
-
 # Use at own risk:
 # options(parallelly.fork.enable = TRUE)
+
+# Reduce the text output from modelling
+lgr::get_logger("mlr3")$set_threshold("warn")
+lgr::get_logger("bbotk")$set_threshold("warn")
 
 ```
 
@@ -85,7 +85,7 @@ covs <- rast(cov_layrs)
 
 We begin modelling with the main probability model showing how likely it is that cheatgrass is present in an area. This is the best model that can be produced with the given data as we are able to make use of both field data and air-photo calls to generate the map. First, we create a bunch of models from a leave-one-out cross validation resampling that we use to evaluate variable importance with. The variable importance values are summed across each of the model runs, and those summed values will replace the variable importance values for the "best model" found from that resampling run (i.e.: it doesn't matter really what the results of this best model was since we only need to use it for it's importance values). With aggregated variable importance found, we can pipe that in to our modelling pipeline as a "feature filtering" step which is combined with hyperparameter tuning at the same stage instead of wrapped in its own auto feature selection step. This was crucial as it vastly improved the modelling speed (don't need to have a 3rd layer of recursion which needs to be resampled) and modelling results (more data can be used to generate models with). With the filtered learner pipeline in place, it gets used as the learner for the autotuner which tunes the num.trees and mtry values of the random forest model. This is the "inner" resampling stage; the best results of the inner resampling stage inform the outer resampling what the best parameters should be set to. Using all of the data that was in the inner resampling as training data, it builds a model and then tests it with the outer test data which has never been used for modelling. This gets repeated until all of the data has been used as testing data exactly once. The best model results are extracted as well as the model in order to create the map prediction.
 
-```{r modelling, include=FALSE}
+```{r probability_modelling, include=FALSE}
 
 tsk_pres <- as_task_classif_st(  
   cheat_pres, target = "presence", positive = "TRUE")
@@ -103,7 +103,7 @@ rr_filter <- resample(tsk_pres, lrn_filter, rsmp("loo"), store_models = TRUE)
 plan(sequential)
 
 # spoof (aggregate) the importance values
-rr_learners <- rr_filter_results$learner
+rr_learners <- rr_filter$learners
 rr_imps <- as.data.frame(
   sapply(rr_learners, function(x) x$importance()))
 rr_imps_vals <- sort(rowSums(rr_imps), decreasing = TRUE)
@@ -160,8 +160,7 @@ outer_learners = lapply(data$learner, "[[", "learner")
 
 # From the same object, extract the table of tuning results which can be viewed
 # and queried 
-outer_results = as.data.table(
-  rr$score(msrs(c("classif.bbrier", "classif.ce", "classif.prauc"))))
+outer_results = as.data.table(rr$score(msrc("classif.bbrier")))
 
 # Now, from the outer learners, extract the one with the lowest binary Brier
 # score. Note that if the data is imbalanced, we should probably evaluate  
@@ -169,18 +168,11 @@ outer_results = as.data.table(
 # according to the documentation
 best_id <- which.min(outer_results$classif.bbrier) 
 best_learner <- outer_learners[[best_id]]$base_learner()
-best_tune <- extract_inner_tuning_results(rr)[best_id, 2:4] 
-best_param_set <- best_learner$param_set 
-best_varimp <- best_learner$importance()
-vip(best_learner, num_features = length(best_varimp))
 
-# Get some model results:
+# Get aggregated results:
 best_agg_score <- rr$aggregate(msr("classif.bbrier"))
-ml_prediction <- rr$prediction()
-ml_confusion <- ml_prediction$confusion
-mod_confusion <- rr$predictions()[[best_id]]$confusion
-mod_oob <- best_learner$model$prediction.error
-autoplot(rr, type = "roc")
+ml_prediction <- as.data.table(rr$prediction())
+ml_confusion <- rr$prediction()$confusion
 
 # Extract the actual ranger model from the mlr3 modelling. Use a custom predict
 # function to extract the "TRUE" probability results only. Also, define the 
@@ -195,6 +187,14 @@ fun <- function(model, ...) predict(model, ...)$predictions[, "TRUE"]
 prob_path <- file.path(out_dir, paste0(proj, "_cheatgrass_probability_model.tif"))
 prob_covs <- covs[[names(ranger_model$variable.importance)]]
 bs <- mlr3spatial:::block_size(prob_covs, chunksize = 1500)
+
+# Clear memory
+rm(lrn_filter, rr_filter, rr_learners, rr_imps, rr_imps_vals, rr_filter_results,
+   best_filter_id, filter_learner, po_filter, lrn_tune, po_lrn, graph, tn, at, rr,
+   data, outer_results, best_id)
+gc()
+
+# Predict model
 prob_predict <- terra::predict(
   prob_covs, ranger_model, fun = fun, na.rm = TRUE,
   filename = prob_path, overwrite = TRUE, wopt = list(
@@ -223,12 +223,21 @@ prob_classes <- writeRaster(prob_classes, file.path(
   out_dir, paste0(proj, "_cheatgrass_probability_model_classified.tif")), 
   overwrite = TRUE, datatype = "INT1U")
 
+# Write the model and machine learned confusion matrix
 saveRDS(ranger_model, file.path(
   out_dir, paste0(proj, "_cheatgrass_probability_model.rds")))
+write.ftable(ftable(cc_ml_confusion), file.path(
+  out_dir, paste0(proj, "_cheatgrass_probability_confusion_matrix.csv")),
+  quote = FALSE, sep = ",")
+write.csv(cbind(tsk_pres$data(), tsk_pres$coordinates()), file.path(
+  out_dir, paste0(proj, "_cheatgrass_probability_model_data.csv")), 
+  row.names = FALSE)
 
 ```
 
 ## Cover, spatial CV
+
+The next model that is run is a cover based model. This uses the raw values of cover from the field data, as well as the "FALSE" air photo calls that have been translated as 0's. Unfortunately with the air photo interpretations, we cannot translate the "TRUE" air photo calls to a number, so those calls do not get used here. Using the data that we have access to, we can train a cheatgrass cover model
 
 ```{r}
 
@@ -237,7 +246,7 @@ tsk_cover$set_col_roles("block", remove_from = "feature")
 
 # Create the learner for feature filtering
 cover_lrn_filter = lrn("regr.ranger", importance = "impurity", 
-                       predict_type = "response")  
+                       predict_type = "response")
 
 plan(multisession, workers = availableCores() %/% 4)
 cover_rr_filter <- resample(
@@ -245,7 +254,7 @@ cover_rr_filter <- resample(
 plan(sequential)
 
 # spoof (aggregate) the importance values
-cover_rr_learners <- cover_rr_filter_results$learner
+cover_rr_learners <- cover_rr_filter$learners
 cover_rr_imps <- as.data.frame(
   sapply(cover_rr_learners, function(x) x$importance()))
 cover_rr_imps_vals <- sort(rowSums(cover_rr_imps), decreasing = TRUE)
@@ -309,22 +318,27 @@ cover_outer_results = as.data.table(cover_rr$score(msr("regr.rmse")))
 # error score.
 cover_best_id <- which.min(cover_outer_results$regr.rmse) 
 cover_best_learner <- cover_outer_learners[[cover_best_id]]$base_learner()
-cover_best_tune <- extract_inner_tuning_results(cover_rr)[cover_best_id, 2:4]
-cover_best_param_set <- cover_best_learner$param_set
-cover_best_varimp <- cover_best_learner$importance()
-vip(cover_best_learner, num_features = length(cover_best_varimp))
 
 # Get some model results:
 cover_best_agg_score <- cover_rr$aggregate(msr("regr.rmse"))
-cover_ml_prediction <- cover_rr$prediction()
-cover_mod_oob <- sqrt(cover_best_learner$model$prediction.error)
+cover_ml_prediction <- as.data.table(cover_rr$prediction())
 
-# Predict model, same way as with probability modelling
+# Extract model and set parameters
 cover_ranger_model <- cover_best_learner$model
 cover_fun <- function(model, ...) predict(model, ...)$predictions
 cover_path <- file.path(out_dir, paste0(proj, "_cheatgrass_cover.tif"))
 cover_covs <- covs[[names(cover_ranger_model$variable.importance)]]
 cover_bs <- mlr3spatial:::block_size(cover_covs, chunksize = 1500)
+
+# Clear memory
+rm(cover_lrn_filter, cover_rr_filter, cover_rr_learners, cover_rr_imps,
+   cover_rr_imps_vals, cover_rr_filter_results, cover_best_filter_id,
+   cover_filter_learner, cover_po_filter, cover_lrn_tune, cover_po_lrn,
+   cover_graph, cover_tn, cover_at, cover_rr, cover_data, cover_outer_learners,
+   cover_best_id, cover_best_learner)
+gc()
+
+# Predict model, same way as with probability modelling
 cover_predict <- terra::predict(
   cover_covs, cover_ranger_model, fun = cover_fun, na.rm = TRUE,
   filename = cover_path, overwrite = TRUE, wopt = list(
@@ -352,6 +366,9 @@ cover_classes <- writeRaster(cover_classes, file.path(
 
 saveRDS(cover_ranger_model, file.path(
   out_dir, paste0(proj, "_cheatgrass_cover_model.rds")))
+write.csv(cbind(tsk_cover$data(), tsk_cover$coordinates()), file.path(
+  out_dir, paste0(proj, "_cheatgrass_cover_model_data.csv")), 
+  row.names = FALSE)
 
 ```
 
@@ -374,11 +391,11 @@ int_cols <- tsk_bal_cc$feature_types[type == "integer"]$id
 gr_smote =
   po("colapply", id = "int_to_num",
     applicator = as.numeric, affect_columns = selector_name(int_cols)) %>>%
-  po("smote", id = "smote1", dup_size = 19) %>>%
-  po("smote", id = "smote2", dup_size = 10) %>>%
-  po("smote", id = "smote3", dup_size = 2) %>>%
+  po("smote", id = "smote1", dup_size = 30) %>>%
+  po("smote", id = "smote2", dup_size = 19) %>>%
+  po("smote", id = "smote3", dup_size = 3) %>>%
   po("smote", id = "smote4", dup_size = 2) %>>%
-  po("classbalancing", id = "classbalance", ratio = 0.5, reference = "major",
+  po("classbalancing", id = "classbalance", ratio = 0.3, reference = "major",
      adjust = "major", shuffle = TRUE) %>>%
   # po("imputeoor") %>>% # Maybe include this, or maybe filter NA's at end?
   po("colapply", id = "num_to_int",
@@ -396,11 +413,12 @@ bal_cc_lrn_filter = lrn("classif.ranger", importance = "impurity",
                         predict_type = "response")  
 
 plan(multisession, workers = availableCores() %/% 4)
-bal_cc_rr_filter <- resample(tsk_bal_cc, bal_cc_lrn_filter, rsmp("loo"), store_models = TRUE)
+bal_cc_rr_filter <- resample(tsk_bal_cc, bal_cc_lrn_filter, rsmp("loo"),
+                             store_models = TRUE)
 plan(sequential)
 
 # spoof (aggregate) the importance values
-bal_cc_rr_learners <- bal_cc_rr_filter_results$learner
+bal_cc_rr_learners <- bal_cc_rr_filter$learners
 bal_cc_rr_imps <- as.data.frame(
   sapply(bal_cc_rr_learners, function(x) x$importance()))
 bal_cc_rr_imps_vals <- sort(rowSums(bal_cc_rr_imps), decreasing = TRUE)
@@ -444,6 +462,11 @@ bal_cc_at <- auto_tuner(
 )
 bal_cc_at$id <- "bal_cc_tuner"
 
+# Write the SMOTE'd dataset to a file
+write.csv(tsk_bal_cc$data(), file.path(
+  out_dir, paste0(proj, "_cover_class_model_data_SMOTE.csv")), 
+  row.names = FALSE)
+
 ```
 
 ## Cover Classes, spatial CV
@@ -466,7 +489,7 @@ unbal_cc_rr_filter <- resample(
 plan(sequential)
 
 # spoof (aggregate) the importance values
-unbal_cc_rr_learners <- unbal_cc_rr_filter_results$learner
+unbal_cc_rr_learners <- unbal_cc_rr_filter$learners
 unbal_cc_rr_imps <- as.data.frame(
   sapply(unbal_cc_rr_learners, function(x) x$importance()))
 unbal_cc_rr_imps_vals <- sort(rowSums(unbal_cc_rr_imps), decreasing = TRUE)
@@ -510,6 +533,9 @@ unbal_cc_at <- auto_tuner(
   terminator = trm("none")
 )
 unbal_cc_at$id <- "unbal_cc_tuner"
+write.csv(cbind(tsk_unbal_cc$data(), tsk_unbal_cc$coordinates()), file.path(
+  out_dir, paste0(proj, "_cover_class_model_data.csv")), 
+  row.names = FALSE)
 
 ```
 
@@ -542,7 +568,7 @@ unbal_cc_rr <- resample(tsk_unbal_cc, unbal_cc_at, rsmp("spcv_coords", folds = 8
 plan(sequential)
 
 # List all of the resample results together
-cc_rr_list <- list(bal_cc_rr, unbal_cc_rr, unbal_cc_rr_ng)
+cc_rr_list <- list(bal_cc_rr, unbal_cc_rr)
 cc_results <- as.data.frame(sapply(cc_rr_list, function(x) {
   cc_data = as.data.table(x)
   cc_outer_learners = lapply(cc_data$learner, "[[", "learner")
@@ -554,7 +580,7 @@ cc_results <- as.data.frame(sapply(cc_rr_list, function(x) {
   
   # Now, from the outer learners, extract the one with the highest (balanced)
   # accuracy score. 
-  cc_best_id <- which.min(cc_outer_results[[msr]])
+  cc_best_id <- which.max(cc_outer_results[[msr]])
   cc_best_learner <- cc_outer_learners[[cc_best_id]]$base_learner()
   # cc_best_tune <- extract_inner_tuning_results(x)[cc_best_id, 2:4]
   # cc_best_param_set <- cc_best_learner$param_set
@@ -582,24 +608,36 @@ cc_outer_results = as.data.table(cc_rr$score(msr(msr)))
 # Now, from the outer learners, extract the one with the highest (balanced)
 # accuracy score. 
 cc_best_id <- which.min(cc_outer_results[[msr]])
+cc_outer_learners <- cc_outer_results$learner
 cc_best_learner <- cc_outer_learners[[cc_best_id]]$base_learner()
-cc_best_tune <- extract_inner_tuning_results(cc_rr)[cc_best_id, 2:4]
-cc_best_param_set <- cc_best_learner$param_set
-cc_best_varimp <- cc_best_learner$importance()
 
 # Get some model results:
 cc_best_agg_score <- cc_rr$aggregate(msr(msr))
-cc_ml_prediction <- cc_rr$prediction()
-cc_ml_confusion <- cc_ml_prediction$confusion
-mod_confusion <- cc_rr$predictions()[[cc_best_id]]$confusion
-mod_oob <- cc_best_learner$model$prediction.error
+cc_ml_prediction <- as.data.table(cc_rr$prediction())
+cc_ml_confusion <- cc_rr$prediction()$confusion
 
-# Predict model
+# Extract model and set parameters
 cc_path <- file.path(out_dir, paste0(proj, "_cheatgrass_cover_class_model.tif"))
 cc_ranger_model <- cc_best_learner$model
 cc_fun <- function(model, ...) predict(model, ...)$predictions
 cc_covs <- covs[[names(cc_ranger_model$variable.importance)]]
 cc_bs <- mlr3spatial:::block_size(cc_covs, chunksize = 1500)
+
+# Clear memory
+rm(gr_smote, bal_cc_lrn_filter, bal_cc_rr_filter, bal_cc_rr_learners,
+   bal_cc_rr_imps, bal_cc_rr_imps_vals, bal_cc_rr_filter_results,
+   bal_cc_best_filter_id, bal_cc_filter_learner, bal_cc_po_filter, 
+   bal_cc_lrn_tune, bal_cc_po_lrn, bal_cc_graph, bal_cc_tn, bal_cc_at,
+   unbal_cc_lrn_filter, unbal_cc_rr_filter, unbal_cc_rr_learners, 
+   unbal_cc_rr_imps, unbal_cc_rr_imps_vals, unbal_cc_rr_filter_results,
+   unbal_cc_best_filter_id, unbal_cc_filter_learner, unbal_cc_po_filter,
+   unbal_cc_lrn_tune, unbal_cc_po_lrn, unbal_cc_graph, unbal_cc_design,
+   unbal_cc_at, bal_cc_rr, unbal_cc_rr, unbal_cc_rr_ng, cc_rr_list, cc_results,
+   cc_results_an, cc_rr, cc_outer_results, cc_best_id, cc_outer_learners,
+   cc_best_learner)
+gc()
+
+# Predict model
 cc_predict <- terra::predict(
   cc_covs, cc_ranger_model, fun = cc_fun, na.rm = TRUE,
   filename = file.path(tempdir(), basename(cc_path)), 
@@ -618,8 +656,12 @@ coltab(cc_predict) <- cls[, c(1, 3)]
 cc_predict <- writeRaster(
   cc_predict, cc_path, overwrite = TRUE, datatype = "INT1U")
 
+# Save model and confusion matrix
 saveRDS(cc_ranger_model, file.path(
   out_dir, paste0(proj, "_cheatgrass_cover_class_model.rds")))
+write.ftable(ftable(cc_ml_confusion), file.path(
+  out_dir, paste0(proj, "_cheatgrass_cover_class_confusion_matrix.csv")),
+  quote = FALSE, sep = ",")
 
 ```
 
@@ -629,5 +671,79 @@ Now, place all modelling results into easily readable CSV files and images.
 
 ```{r}
 
+# Variable importance
+prob_varimp <- cbind(data.frame(
+  model = "probability"), 
+  t(data.frame(sort(ranger_model$variable.importance, decreasing = TRUE))))
+prob_varimp[nrow(prob_varimp) + 1, ] <- ""
+cover_varimp <- cbind(data.frame(
+  model = "cover"), 
+  t(data.frame(sort(cover_ranger_model$variable.importance, decreasing = TRUE))))
+cover_varimp[nrow(cover_varimp) + 1, ] <- ""
+cc_varimp <- cbind(data.frame(
+  model = "cover class"), 
+  t(data.frame(sort(cc_ranger_model$variable.importance, decreasing = TRUE))))
+cc_varimp[nrow(cc_varimp) + 1, ] <- ""
+write.table(prob_varimp, file.path(
+  out_dir, paste0(proj, "_model_importance.csv")), 
+  row.names = FALSE, append = TRUE, sep = ",")
+write.table(cover_varimp, file.path(
+  out_dir, paste0(proj, "_model_importance.csv")), 
+  row.names = FALSE, append = TRUE, sep = ",")
+write.table(cc_varimp, file.path(
+  out_dir, paste0(proj, "_model_importance.csv")), 
+  row.names = FALSE, append = TRUE, sep = ",")
+
+prob_varimp_fig <- vip(ranger_model, num_features = length(prob_varimp))
+cover_varimp_fig <- vip(cover_ranger_model, num_features = length(cover_varimp))
+cc_varimp_fig <- vip(cc_ranger_model, num_features = length(cc_varimp))
+ggsave(file.path(out_dir, paste0(
+  proj, "_cheatgrass_probability_model_importance.png")),
+  plot = prob_varimp_fig, width = 6.5, height = 6.5, units = "in")
+ggsave(file.path(out_dir, paste0(
+  proj, "_cheatgrass_cover_model_importance.png")),
+  plot = cover_varimp_fig, width = 6.5, height = 6.5, units = "in")
+ggsave(file.path(out_dir, paste0(
+  proj, "_cheatgrass_cover_class_model_importance.png")),
+  plot = cc_varimp_fig, width = 6.5, height = 6.5, units = "in")
+
+# Tune results
+prob_tune <- c(
+  num.samples = ranger_model$num.samples,
+  num.features = ranger_model$num.independent.variables,
+  num.trees = ranger_model$num.trees,
+  mtry = ranger_model$mtry)
+cover_tune <- c(
+  num.samples = cover_ranger_model$num.samples,
+  num.features = cover_ranger_model$num.independent.variables,
+  num.trees = cover_ranger_model$num.trees,
+  mtry = cover_ranger_model$mtry)
+cc_tune <- c(
+  num.samples = cc_ranger_model$num.samples,
+  num.features = cc_ranger_model$num.independent.variables,
+  num.trees = cc_ranger_model$num.trees,
+  mtry = cc_ranger_model$mtry)
+tune_scores <- data.frame(
+  model = c("probability", "cover", "cover class"),
+  rbind(prob_tune, cover_tune, cc_tune))
+
+# Machine learning metrics
+agg_scores <- data.frame(
+  model = c("probability", "cover", "cover class"),
+  measure = names(c(best_agg_score, cover_best_agg_score, cc_best_agg_score)),
+  score = c(best_agg_score, cover_best_agg_score, cc_best_agg_score))
+write.csv(agg_scores, file.path(
+  out_dir, paste0(proj, "_machine_learning_metrics.csv")), row.names = FALSE)
+
+# Model metrics
+mod_scores <- cbind(tune_scores, data.frame(
+  measure = c("OOB prediction error (Binary Brier score)", 
+              "OOB prediction error (RMSE)",
+              "OOB prediction error (%)"),
+  score = c(ranger_model$prediction.error, 
+            sqrt(cover_ranger_model$prediction.error),
+            cc_ranger_model$prediction.error)))
+write.csv(mod_scores, file.path(
+  out_dir, paste0(proj, "_model_metrics.csv")), row.names = FALSE)
 
 ```
