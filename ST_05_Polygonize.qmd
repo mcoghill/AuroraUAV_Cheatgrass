@@ -47,11 +47,12 @@ shp_dir <- file.path(out_dir, "Shapefiles")
 dir.create(shp_dir, showWarnings = FALSE)
 
 # Define input file names
-prob_classes <- file.path(
-  out_dir, paste0(proj, "_cheatgrass_probability_model_classified.tif"))
-cover_classes <- file.path(
-  out_dir, paste0(proj, "_cheatgrass_cover_model_classified.tif"))
-cc <- file.path(out_dir, paste0(proj, "_cheatgrass_cover_class_model.tif"))
+prob_classes <- file.path(out_dir, "Probability", paste0(
+  proj, "_cheatgrass_probability_model_classified.tif"))
+cover_classes <- file.path(out_dir, "Cover", paste0(
+  proj, "_cheatgrass_cover_model_classified.tif"))
+cc <- file.path(out_dir, "Cover Class", paste0(
+  proj, "_cheatgrass_cover_class_model.tif"))
 
 # Polygonize each classification raster in a loop
 poly_classes <- lapply(c(prob_classes, cover_classes, cc), function(x) {
@@ -65,6 +66,7 @@ poly_classes <- lapply(c(prob_classes, cover_classes, cc), function(x) {
   poly_simple <- as.polygons(r_ag) |> 
     st_as_sf() |> 
     ms_simplify()
+  names(poly_simple) <- c("class", "geometry")
   st_write(
     poly_simple, file.path(shp_dir, gsub(".tif", ".shp", basename(x))),
     quiet = TRUE, delete_dsn = TRUE)
