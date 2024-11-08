@@ -160,7 +160,7 @@ outer_learners = lapply(data$learner, "[[", "learner")
 
 # From the same object, extract the table of tuning results which can be viewed
 # and queried 
-outer_results = as.data.table(rr$score(msrc("classif.bbrier")))
+outer_results = as.data.table(rr$score(msr("classif.bbrier")))
 
 # Now, from the outer learners, extract the one with the lowest binary Brier
 # score. Note that if the data is imbalanced, we should probably evaluate  
@@ -191,7 +191,7 @@ bs <- mlr3spatial:::block_size(prob_covs, chunksize = 1500)
 # Clear memory
 rm(lrn_filter, rr_filter, rr_learners, rr_imps, rr_imps_vals, rr_filter_results,
    best_filter_id, filter_learner, po_filter, lrn_tune, po_lrn, graph, tn, at, rr,
-   data, outer_results, best_id)
+   data, outer_learners, outer_results, best_id, best_learner)
 gc()
 
 # Predict model
@@ -226,7 +226,7 @@ prob_classes <- writeRaster(prob_classes, file.path(
 # Write the model and machine learned confusion matrix
 saveRDS(ranger_model, file.path(
   out_dir, paste0(proj, "_cheatgrass_probability_model.rds")))
-write.ftable(ftable(cc_ml_confusion), file.path(
+write.ftable(ftable(ml_confusion), file.path(
   out_dir, paste0(proj, "_cheatgrass_probability_confusion_matrix.csv")),
   quote = FALSE, sep = ",")
 write.csv(cbind(tsk_pres$data(), tsk_pres$coordinates()), file.path(
@@ -335,7 +335,7 @@ rm(cover_lrn_filter, cover_rr_filter, cover_rr_learners, cover_rr_imps,
    cover_rr_imps_vals, cover_rr_filter_results, cover_best_filter_id,
    cover_filter_learner, cover_po_filter, cover_lrn_tune, cover_po_lrn,
    cover_graph, cover_tn, cover_at, cover_rr, cover_data, cover_outer_learners,
-   cover_best_id, cover_best_learner)
+   cover_best_id, cover_best_learner, cover_outer_results)
 gc()
 
 # Predict model, same way as with probability modelling
