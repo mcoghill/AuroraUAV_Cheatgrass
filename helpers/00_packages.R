@@ -34,9 +34,6 @@ if(i) {
   # install.packages(dl_path, repos = NULL, type = "source")
 }
 
-# Install my custom lidR function
-# devtools::install_github("mcoghill/lidR.li2012enhancement")
-
 # SAGA GIS - Choose version (check at https://sourceforge.net/projects/saga-gis/)
 # A note on versions: There is a bug from version 9.5.1 on that prevents the 
 # "Basic Terrain Analysis" tool to proceed. I have notified the SAGA GIS team
