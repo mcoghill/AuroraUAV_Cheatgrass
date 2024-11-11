@@ -9,9 +9,9 @@ editor: visual
 
 This final script will take the classified rasters from the modelling and convert them into shapefiles for production. This script will tackle the "post-processing" of the maps using the R implementation of mapshaper, "rmapshaper". We begin with loading the required packages:
 
-```{r}
+```{r init, include=FALSE}
 
-ls <- c("terra", "sf", "rmapshaper")  
+ls <- c("terra", "sf", "rmapshaper", "units", "future.apply")  
 invisible(suppressPackageStartupMessages(   
   lapply(ls, library, character.only = TRUE))) 
 rm(ls)  
@@ -25,7 +25,7 @@ serv_conn <- "Synology"
 
 Now, we can define where the classified rasters are saved and then generate the shapefiles of each of the classified rasters.
 
-```{r}
+```{r polygonize, include=FALSE}
 
 # Determine server directory method (change username if using SFTP connection) 
 if(serv_conn == "SFTP") {  
@@ -42,6 +42,7 @@ if(serv_conn == "SFTP") {
 proj <- "South Thompson"  
 
 # Define input directory and shapefile directory for writing shapefiles to
+proc_dir <- file.path(serv, "Processed Imagery", proj)
 out_dir <- file.path(serv, "Modelling/Outputs", proj) 
 shp_dir <- file.path(out_dir, "Shapefiles")
 dir.create(shp_dir, showWarnings = FALSE)
@@ -73,6 +74,64 @@ poly_classes <- lapply(c(prob_classes, cover_classes, cc), function(x) {
   return(poly_simple)
 })
 
+```
 
+Get the total flight areas. Two metrics are generated here: A total flight area of all flights before they were clipped, as well as a total flight area of the clipped area (i.e.: what was used for modelling). To get the total flight area, we turn to the original datasets from before they were clipped and resampled to 0.5m^2^. Both RGB and NDVI layers are used here to represent the combined efforts of flying RGB and multispectral. There are 4 RGB layers: R, G, B, and transparency. We load the transparency layer for RGB imagery, and the NDVI layer for NDVI. The datasets are then resampled to a 2.5m^2^ resolution, both as a way to match the resolution of the converted shapefile and to significantly reduce the processing time and memory requirements. Pixel values of either are converted to TRUE/FALSE based on whether they meet a numerical criteria. All polygons have any holes removed in the output polygon geometry, and this layer is then written to a file in a temporary folder. Each layer is combined (dissolved) to get the combined total flight area for the entire project.
+
+For the clipped areas, a similar method is applied except that the classified rasters are used to calculate the total area from a 2.5m^2^ resolution raster. These polygons are already the entire modelled area so they don't need to be aggregated again; instead, we just want to get the "largest" of the three modelled areas (these should be similar to each other from the get-go, but `max()` is used just in case).
+
+```{r area_calc, include=FALSE}
+
+# List raw RGB and NDVI flights
+all_flights <- list.files(
+  proc_dir, pattern = "_transparent_mosaic_group1.tif$|_index_ndvi.tif$",
+  full.names = TRUE, recursive = TRUE)
+td <- tempdir()
+
+# Generate polygons of total flight areas (write to file for future package)
+plan(multisession, workers = availableCores() %/% 2)
+flight_poly_gpkgs <- future_lapply(all_flights, function(x) {
+  out <- file.path(td, gsub(".tif", ".gpkg", basename(x)))
+  if(grepl("_transparent_mosaic_group1.tif$", x)) {
+    r <- rast(x, lyrs = 4)
+    dr <- rast(ext(r), res = 2.5, crs = crs(r))
+    rr <- resample(r, dr, method = "near")
+    rr[rr <= 0] <- NA
+    v <- as.polygons(rr) %>% fillHoles()
+  } else {
+    r <- rast(x)
+    dr <- rast(ext(r), res = 2.5, crs = crs(r))
+    rr <- resample(r, dr, method = "bilinear")
+    v <- as.polygons(rr > -Inf) %>% fillHoles()
+  }
+  writeVector(v, out, overwrite = TRUE)
+  return(out)
+}, future.seed = NULL)
+plan(sequential)
+
+# Read in the total flight area polygons and dissolve (aggregate) them together
+flight_polys <- do.call(rbind, lapply(flight_poly_gpkgs, vect)) %>% 
+  aggregate()
+
+# Generate polygons of clipped flight areas
+clipped_polys <- lapply(c(prob_classes, cover_classes, cc), function(x) {
+  r <- rast(x)
+  dr <- rast(ext(r), res = 2.5, crs = crs(r))
+  rr <- resample(r, dr, method = "near", threads = TRUE)
+  v <- as.polygons(rr > 0) %>% fillHoles()
+})
+clipped_polys <- clipped_polys[[which.max(sapply(clipped_polys, expanse))]]
+
+# Calculate the area flown vs. the clipped area
+total_area <- set_units(expanse(flight_polys), "m2")
+clipped_area <- set_units(expanse(clipped_polys), "m2")
+total_area_ha <- set_units(total_area, "ha")
+clipped_area_ha <- set_units(clipped_area, "ha")
+write.csv(cbind(total_area_ha, clipped_area_ha), 
+          file.path(out_dir, "Flight_area.csv"), row.names = FALSE)
+writeVector(flight_polys, file.path(out_dir, "Total_flight_area.gpkg"), 
+            overwrite = TRUE)
+writeVector(clipped_polys, file.path(out_dir, "Clipped_flight_area.gpkg"), 
+            overwrite = TRUE)
 
 ```

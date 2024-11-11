@@ -7,6 +7,10 @@ editor: visual
 
 # Cheatgrass Modelling
 
+This script takes the data generated from the previous two scripts (predictor layer generation and variable extraction) and creates many models from that data. The best fit model is what is used to create the mapped predictions. Models are resampled using either spatial cross validation, or regular cross validation depending on the model type and if it was inner/outer resampling. Model metrics are generated and saved at the end of the script. Due to the large number of models generated, RAM usage spikes. After modelling, the extra models are removed from the system in order to prevent the R session from bogging down too much.
+
+First, load the required packages.
+
 ```{r init, include=FALSE}
 
 ls <- c("tidyverse", "terra", "sf", "mlr3verse", "mlr3spatial", "ranger",
@@ -31,7 +35,7 @@ lgr::get_logger("bbotk")$set_threshold("warn")
 
 ## Load field data, points, and air photo points
 
-Next, we will initialize the folders and files used in the data extraction itself. Data wrangling will be performed such that we have a single file for performing data extractions in the following chunk.
+Next, we will initialize the folders and files used during modelling. Data wrangling is performed on the cover data to create a new dataset of "cover classes". This allots us with a total of 3 models: a probability of presence model (binary classification), a cover model showing raw cover values (regression), and a cover class model (classification).
 
 ```{r load_data, include=FALSE}
 
@@ -126,8 +130,7 @@ po_lrn = po("learner", lrn_tune)
 # Create the graph learner object that will combine these 
 graph = as_learner(po_filter %>>% po_lrn)  
 
-# Create the tuning design grid - I figured out how to tune across all mtry 
-# values (yay!) 
+# Create the tuning design grid to tune across possible nfeat and mtry values
 design <- expand.grid(
   importance.filter.nfeat = length(tsk_pres$feature_names):4,    
   classif.ranger.num.trees = c(500, 1000, 2000), 
@@ -207,7 +210,7 @@ rcl <- matrix(c(
   0.10, 0.40, 2,  
   0.40, 0.60, 3, 
   0.60, 0.90, 4,  
-  0.90, Inf, 5), ncol = 3, byrow = TRUE) 
+  0.90, Inf, 5), ncol = 3, byrow = TRUE)
 cls <- data.frame(  
   id = 1:5,   
   class = c("Very unlikely to occur (0-10%)", 
@@ -215,31 +218,32 @@ cls <- data.frame(
             "May occur about half of the time (41-60%)",   
             "Likely to occur (61-90%)", "Very likely to occur (91-100%)"),  
   col = c("green", "deepskyblue", "yellow", "orange", "red"))  
-
 prob_classes <- classify(prob_predict, rcl) 
+
+# Provide factor classes and associated colours for each level. Write to .tif file
 levels(prob_classes) <- cls[, 1:2] 
 coltab(prob_classes) <- cls[, c(1, 3)] 
 prob_classes <- writeRaster(prob_classes, file.path(   
   out_dir, paste0(proj, "_cheatgrass_probability_model_classified.tif")), 
   overwrite = TRUE, datatype = "INT1U")
 
-# Write the model and machine learned confusion matrix
+# Write the model, input data, and machine learned confusion matrix
 saveRDS(ranger_model, file.path(
   out_dir, paste0(proj, "_cheatgrass_probability_model.rds")))
-write.ftable(ftable(ml_confusion), file.path(
-  out_dir, paste0(proj, "_cheatgrass_probability_confusion_matrix.csv")),
-  quote = FALSE, sep = ",")
 write.csv(cbind(tsk_pres$data(), tsk_pres$coordinates()), file.path(
   out_dir, paste0(proj, "_cheatgrass_probability_model_data.csv")), 
   row.names = FALSE)
+write.ftable(ftable(ml_confusion), file.path(
+  out_dir, paste0(proj, "_cheatgrass_probability_confusion_matrix.csv")),
+  quote = FALSE, sep = ",")
 
 ```
 
 ## Cover, spatial CV
 
-The next model that is run is a cover based model. This uses the raw values of cover from the field data, as well as the "FALSE" air photo calls that have been translated as 0's. Unfortunately with the air photo interpretations, we cannot translate the "TRUE" air photo calls to a number, so those calls do not get used here. Using the data that we have access to, we can train a cheatgrass cover model
+The next model that is run is a cover based model. This uses the raw values of cover from the field data, as well as the "FALSE" air photo calls that have been translated as 0's. Unfortunately with the air photo interpretations, we cannot translate the "TRUE" air photo calls to a number, so those calls do not get used here. Using the data that we have access to, we can train a cheatgrass cover model using a random forest regression model. We begin similarly by finding a rough idea about the variable importance before feeding that information into the final model of cover. The predicted map of cover gets classified at the end to produce a "cover class" map. This is not to be confused with modelling cover classes, which is an entirely different process addressed down below.
 
-```{r}
+```{r cover_modelling, include=FALSE}
 
 tsk_cover <- as_task_regr_st(cheat_cover, target = "cover")
 tsk_cover$set_col_roles("block", remove_from = "feature")
@@ -278,8 +282,7 @@ cover_po_lrn = po("learner", cover_lrn_tune)
 # Create the graph learner object that will combine these 
 cover_graph = as_learner(cover_po_filter %>>% cover_po_lrn)  
 
-# Create the tuning design grid - I figured out how to tune across all mtry 
-# values (yay!) 
+# Create the tuning design grid to tune across possible nfeat and mtry values
 cover_design <- expand.grid(
   importance.filter.nfeat = (length(tsk_cover$feature_names)):4,   
   regr.ranger.num.trees = c(500, 1000, 2000),          
@@ -314,8 +317,9 @@ cover_outer_learners = lapply(cover_data$learner, "[[", "learner")
 # and queried 
 cover_outer_results = as.data.table(cover_rr$score(msr("regr.rmse")))  
 
-# Now, from the outer learners, extract the one with the lowest mean absolute
-# error score.
+# Now, from the outer learners, extract the one with the lowest root mean squared
+# error score as this will represent actual percent cover differences in predicted
+# vs. actual data
 cover_best_id <- which.min(cover_outer_results$regr.rmse) 
 cover_best_learner <- cover_outer_learners[[cover_best_id]]$base_learner()
 
@@ -358,12 +362,15 @@ cover_cls <- data.frame(
             "Mild Infestation (25-50%)", "Cheatgrass Dominated (50-100%)"),   
   col = c("green", "deepskyblue", "yellow", "orange", "red"))  
 cover_classes <- classify(cover_predict, cover_rcl) 
+
+# Provide factor classes and associated colours for each level. Write to .tif file
 levels(cover_classes) <- cover_cls[, 1:2] 
 coltab(cover_classes) <- cover_cls[, c(1, 3)] 
 cover_classes <- writeRaster(cover_classes, file.path(   
   out_dir, paste0(proj, "_cheatgrass_cover_model_classified.tif")),
   overwrite = TRUE, datatype = "INT1U")
 
+# Write the model and input data
 saveRDS(cover_ranger_model, file.path(
   out_dir, paste0(proj, "_cheatgrass_cover_model.rds")))
 write.csv(cbind(tsk_cover$data(), tsk_cover$coordinates()), file.path(
@@ -374,7 +381,11 @@ write.csv(cbind(tsk_cover$data(), tsk_cover$coordinates()), file.path(
 
 ## Balanced cover classes, non-spatial CV
 
-```{r}
+An inherent issue with our data is that we have a wild class imbalance (i.e.: lots of "Free (0%) calls but few other calls). One way to overcome this issue is to undersample majority classes as well as oversample underrepresented classes. Doing so will balance the data; however, we lose the ability to perform spatial cross validation in this manner. There might be a way to incorporate spatial cross validation back into the dataset by providing block ID's and then using block cross validation instead of regular cross validation, however I ran out of time before being able to attempt to figure that out.
+
+The script begins with class balancing using the "SMOTE" algorithm to get roughly similar numbers for sampled data. Then, it proceeds pretty similarly to the steps involved with the presence and cover models: first, find the variable importances of each variable in a small model, and use that information to provide the order of variables used in determining the number of variables to use in the model.
+
+```{r bal_cc_modelling, include=FALSE}
 
 tsk_bal_cc <- as_task_classif(
   st_drop_geometry(cheat_cc), target = "cover_class", id = "bal_cc_aspatial")
@@ -443,8 +454,7 @@ bal_cc_po_lrn = po("learner", bal_cc_lrn_tune)
 # Create the graph learner object that will combine these 
 bal_cc_graph = as_learner(bal_cc_po_filter %>>% bal_cc_po_lrn)  
 
-# Create the tuning design grid - I figured out how to tune across all mtry 
-# values (yay!) 
+# Create the tuning design grid to tune across possible nfeat and mtry values
 bal_cc_design <- expand.grid(
   importance.filter.nfeat = length(tsk_bal_cc$feature_names):4,    
   classif.ranger.num.trees = c(500, 1000, 2000), 
@@ -452,7 +462,7 @@ bal_cc_design <- expand.grid(
   dplyr::filter(classif.ranger.mtry <= importance.filter.nfeat) 
 bal_cc_tn <- tnr("design_points", design = as.data.table(bal_cc_design)) 
 
-# Create the auto-tuner object 
+# Create the auto-tuner object and give it a uniuqe ID 
 bal_cc_at <- auto_tuner(  
   tuner = bal_cc_tn,  
   learner = bal_cc_graph,  
@@ -471,9 +481,9 @@ write.csv(tsk_bal_cc$data(), file.path(
 
 ## Cover Classes, spatial CV
 
-Now, create similar objects using the original imbalanced data.
+We also build a cover class model using spatial cross validation, but it lacks the SMOTE usage here so classes are left imbalanced.
 
-```{r}
+```{r unbal_cc_modelling, include=FALSE}
 
 tsk_unbal_cc <- as_task_classif_st(
   cheat_cc, target = "cover_class", id = "unbal_cc_spatial")
@@ -515,8 +525,7 @@ unbal_cc_po_lrn = po("learner", unbal_cc_lrn_tune)
 # Create the graph learner object that will combine these
 unbal_cc_graph = as_learner(unbal_cc_po_filter %>>% unbal_cc_po_lrn)
 
-# Create the tuning design grid - I figured out how to tune across all mtry
-# values (yay!)
+# Create the tuning design grid to tune across possible nfeat and mtry values
 unbal_cc_design <- expand.grid(
   importance.filter.nfeat = length(tsk_unbal_cc$feature_names):4,
   classif.ranger.num.trees = c(500, 1000, 2000),
@@ -524,7 +533,7 @@ unbal_cc_design <- expand.grid(
   dplyr::filter(classif.ranger.mtry <= importance.filter.nfeat)
 unbal_cc_tn <- tnr("design_points", design = as.data.table(unbal_cc_design))
 
-# Create the auto-tuner object
+# Create the auto-tuner object and give it a uniuqe ID
 unbal_cc_at <- auto_tuner(
   tuner = unbal_cc_tn,
   learner = unbal_cc_graph,
@@ -533,6 +542,8 @@ unbal_cc_at <- auto_tuner(
   terminator = trm("none")
 )
 unbal_cc_at$id <- "unbal_cc_tuner"
+
+# Write the input dataset
 write.csv(cbind(tsk_unbal_cc$data(), tsk_unbal_cc$coordinates()), file.path(
   out_dir, paste0(proj, "_cover_class_model_data.csv")), 
   row.names = FALSE)
@@ -545,11 +556,13 @@ True benchmarking doesn't work because of differing task types, but I can essent
 
 -   classif.acc is used for balanced datasets while classif.bacc is used for unbalanced datasets
 
--   Class balancing is sure to have a positive model impact, though the map might not really be true
+-   Class balancing is sure to have a positive model impact, though the map might not be as true to life as expected
 
 -   A fair comparison would be between the class balanced dataset (non-spatial) and an imbalanced dataset that is also non-spatial; however, this takes time to produce and is not expected to outperform the balanced dataset.
 
-```{r}
+A best model is chosen manually from looking at the combined aggregated model accuracy score, individual best model accuracy score from the outer cross validation, and the internal model's OOB error score. This is the chosen model for map predictions for cover class modelling.
+
+```{r cc_bench, include=FALSE}
 
 # Runs both outer and inner loops in parallel
 plan(list(
@@ -574,7 +587,8 @@ cc_results <- as.data.frame(sapply(cc_rr_list, function(x) {
   cc_outer_learners = lapply(cc_data$learner, "[[", "learner")
   
   # From the same object, extract the table of tuning results which can be 
-  # viewed and queried
+  # viewed and queried. Use "classif.acc" for the balanced data, and
+  # "classif.bacc" for the unbalanced data
   msr <- ifelse(x$task_type == "classif", "classif.acc", "classif.bacc")
   cc_outer_results = as.data.table(x$score(msr(msr)))
   
@@ -582,21 +596,17 @@ cc_results <- as.data.frame(sapply(cc_rr_list, function(x) {
   # accuracy score. 
   cc_best_id <- which.max(cc_outer_results[[msr]])
   cc_best_learner <- cc_outer_learners[[cc_best_id]]$base_learner()
-  # cc_best_tune <- extract_inner_tuning_results(x)[cc_best_id, 2:4]
-  # cc_best_param_set <- cc_best_learner$param_set
-  # cc_best_varimp <- cc_best_learner$importance()
-  # 
-  # # Get some model results:
+
+  # Get some model results:
   cc_best_agg_score <- x$aggregate(msr(msr))
-  # cc_ml_prediction <- x$prediction()
-  # cc_ml_confusion <- cc_ml_prediction$confusion
-  # mod_confusion <- x$predictions()[[cc_best_id]]$confusion
   mod_oob <- cc_best_learner$model$prediction.error
   return(list(aggregated_score = cc_best_agg_score,
               outer_fold_msr = max(cc_outer_results[[msr]]),
               model_oob = mod_oob))
 }))
 
+# Use some math to "roughly estimate" model performance across aggregated, 
+# individual, and model specific scores
 cc_results_an <- (unlist(cc_results[1, ]) + unlist(cc_results[2, ]) - 
   unlist(cc_results[3, ])) %>% unname()
 
@@ -637,7 +647,8 @@ rm(gr_smote, bal_cc_lrn_filter, bal_cc_rr_filter, bal_cc_rr_learners,
    cc_best_learner)
 gc()
 
-# Predict model
+# Predict model, specifying datatype to be INT1U. Write to a temporary file
+# as we still need a color table to be written to it.
 cc_predict <- terra::predict(
   cc_covs, cc_ranger_model, fun = cc_fun, na.rm = TRUE,
   filename = file.path(tempdir(), basename(cc_path)), 
@@ -646,32 +657,33 @@ cc_predict <- terra::predict(
     names = paste0(proj, "_cheatgrass_cover_class_model"),
     datatype = "INT1U"))
 
+# Provide factor classes and associated colours for each level. Write to .tif file
 cls <- data.frame(
   id = 1:5,
   class = c("Free (0%)", "Trace (1-5%)", "Light Infestation (5-25%)",
             "Mild Infestation (25-50%)", "Cheatgrass Dominated (50-100%)"),
   col = c("green", "deepskyblue", "yellow", "orange", "red"))
-
 coltab(cc_predict) <- cls[, c(1, 3)]
 cc_predict <- writeRaster(
   cc_predict, cc_path, overwrite = TRUE, datatype = "INT1U")
 
-# Save model and confusion matrix
+# Save model and confusion matrix. Delete temporary file
 saveRDS(cc_ranger_model, file.path(
   out_dir, paste0(proj, "_cheatgrass_cover_class_model.rds")))
 write.ftable(ftable(cc_ml_confusion), file.path(
   out_dir, paste0(proj, "_cheatgrass_cover_class_confusion_matrix.csv")),
   quote = FALSE, sep = ",")
+unlink(file.path(tempdir(), basename(cc_path)))
 
 ```
 
 ## Modelling results
 
-Now, place all modelling results into easily readable CSV files and images.
+Now, place all modelling results into easily readable CSV files and images. This includes variable importance metrics and images, tuning results (best nfeat, num.trees, and mtry values), machine learning metrics (aggregated scores), and model specific metrics.
 
-```{r}
+```{r mod_results, include=FALSE}
 
-# Variable importance
+# Variable importance data
 prob_varimp <- cbind(data.frame(
   model = "probability"), 
   t(data.frame(sort(ranger_model$variable.importance, decreasing = TRUE))))
@@ -694,6 +706,7 @@ write.table(cc_varimp, file.path(
   out_dir, paste0(proj, "_model_importance.csv")), 
   row.names = FALSE, append = TRUE, sep = ",")
 
+# Variable importance figures
 prob_varimp_fig <- vip(ranger_model, num_features = length(prob_varimp))
 cover_varimp_fig <- vip(cover_ranger_model, num_features = length(cover_varimp))
 cc_varimp_fig <- vip(cc_ranger_model, num_features = length(cc_varimp))

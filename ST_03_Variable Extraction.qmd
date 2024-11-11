@@ -7,7 +7,7 @@ editor: visual
 
 # Variable Extraction
 
-The overarching goal of this script is to take the predictor layers generated from the ST_02 script together with the field collected data and extract the data from those predictor layers. This dataset will be what is used for modelling later on.
+The overarching goal of this script is to take the predictor layers generated from the ST_02 script together with the field collected and air photo interpreted data and extract the data from those predictor layers. This dataset will be what is used for modelling later on.
 
 First, load the libraries that will be used for this script.
 
@@ -28,7 +28,9 @@ serv_conn <- "Synology"
 
 ## Load field data, points, and air photo points
 
-Next, we will initialize the folders and files used in the data extraction itself. Data wrangling will be performed such that we have a single file for performing data extractions in the following chunk.
+Next, we will initialize the folders and files used in the data extraction itself. Data wrangling will be performed such that we have a single file for performing data extractions in the following chunk. Field data is included in KML files from each of the observers, as well as an associated spreadsheet with the data input. The KML files and spreadsheet are merged together on the block and plot names. Provisions have been made for an altered KML file not following the same patterns as the remaining KML files.
+
+Towards the end of this chunk, block numbers for blocking in mlr3 are added in. These did not end up getting used in the end, but the code used here will not impact any of the analyses so it is left in for posterity.
 
 ```{r load_data, include=FALSE}
 
@@ -66,6 +68,7 @@ f_data <- read_excel(f_data_p, skip = 2, col_types = "guess") %>%
   rename(plot = avenza_plot_number, cover = cheatgrass) %>% 
   mutate(cover = replace_na(cover, 0))
 
+# Read in the field points, provide fix for altered KML file
 f_pts <- do.call(rbind, lapply(f_pts_p, function(x) {
   
   if(nrow(st_layers(x)) > 1) {
@@ -132,6 +135,7 @@ missing_fpts <- left_join(f_data, f_pts, by = c("block", "plot")) %>%
          surveyor = "Grant",
          presence = cover > 0, .after = cover)
 
+# Help with missing data - add spatial points to those
 fd_missing <- st_read(f_pts_p[1], quiet = TRUE) %>% 
   janitor::clean_names() %>% 
   select(-description) %>% 
@@ -147,6 +151,7 @@ fd_missing_join <- left_join(missing_fpts, fd_missing, by = "plot_id") %>%
   select(-plot_id) %>% 
   st_sf()
 
+# Combine the field data and fixed missing data
 fd <- rbind(fd, fd_missing_join) %>% 
   arrange(block, plot)
 
@@ -174,6 +179,7 @@ fd_full <- rbind(
          .before = cover) %>% 
   arrange(block, presence, cover)
 
+# Create blocks used for blocking in mlr3 (next script)
 # Ensure that each block has a minimum of 5 observations of one presence/absence:
 fd_check <- lapply(unique(fd_full$block), function(x) {
   table(fd_full %>% 
@@ -209,8 +215,6 @@ while(any(fd_check2)) {
     })
   }
   
-  
-  
   if(length(fd_check2) <= 3) {
     fd_unfull$block <- as.numeric(names(fd_check)[1])
   }
@@ -234,7 +238,9 @@ fd_final <- vect(fd_fix)
 
 ## Raster extraction
 
-Next, we will extract all of the covariate raster data at each of the points. At this stage, we also need to determine which raster layers to use and which ones will be omitted from modelling altogether. Once raster data is extracted it will be separated into two datasets: one for the cover data, and another for the presence/absence data. These can be saved in the same geopackage file to be pulled in during the modelling script.
+Next, we will extract all of the covariate raster data at each of the points. At this stage, we also need to determine which raster layers to use and which ones will be omitted from modelling altogether. The first stage of that is computing min and max values of a variable; if they are all the same ahen they should probably not be used. Additionally, if there are highly correltated variables then these should be removed from the dataet.
+
+Once raster data is extracted it will be separated into two datasets: one for the cover data, and another for the presence/absence data. These can be saved in the same geopackage file to be pulled in during the modelling script.
 
 ```{r raster_extraction, include=FALSE}
 
