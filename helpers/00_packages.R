@@ -5,7 +5,7 @@
 ls <- c("tidyverse", "lidR", "sf", "sfheaders", "future.apply", "terra", 
   "data.table", "units", "rmapshaper", "lwgeom", "RCSF", "lme4", "devtools",
   "RStoolbox", "mlr3verse", "mlr3spatial", "mlr3spatiotempcv", "corrplot",
-  "readxl", "vip", "ranger", "Rsagacmd")
+  "readxl", "vip", "ranger", "Rsagacmd", "clhs", "raster", "bcmaps", "bcdata")
 
 new_packages <- ls[!(ls %in% installed.packages()[, "Package"])]
 if(length(new_packages)) install.packages(new_packages)
