@@ -2,7 +2,7 @@
 title: "ST_03_Variable Extraction"
 author: "Matthew Coghill"
 format: html
-editor: visual
+editor: source
 ---
 
 # Variable Extraction
@@ -16,10 +16,11 @@ First, load the libraries that will be used for this script.
 ls <- c("tidyverse", "readxl", "terra", "sf", "corrplot")
 
 invisible(suppressPackageStartupMessages(
-  lapply(ls, library, character.only = TRUE)))
+  lapply(ls, library, character.only = TRUE)
+))
 rm(ls)
 
-# Set file access either over SFTP connection, Local LAN, or through the 
+# Set file access either over SFTP connection, Local LAN, or through the
 # Synology Drive app (i.e.: "SFTP", "Local", "SynologyDrive", or whatever the
 # folder name is for your Synology Drive app location)
 serv_conn <- "Synology"
@@ -35,155 +36,176 @@ Towards the end of this chunk, block numbers for blocking in mlr3 are added in. 
 ```{r load_data, include=FALSE}
 
 # Determine server directory method (change username if using SFTP connection)
-if(serv_conn == "SFTP") {
+if (serv_conn == "SFTP") {
   user <- "mcoghill"
   serv <- paste0("//", user, "@aurorauav.synology.me/Cheatgrass")
-} else if(serv_conn == "Local") {
+} else if (serv_conn == "Local") {
   serv <- "//AuroraNAS/Cheatgrass"
-} else if(serv_conn == "Synology") {
+} else if (serv_conn == "Synology") {
   serv <- file.path(Sys.getenv("USERPROFILE"), "SynologyDrive/Cheatgrass")
-} else serv <- serv_conn
+} else {
+  serv <- serv_conn
+}
 
-# Get the field data files (note: looking to move this to a different folder 
+# Get the field data files (note: looking to move this to a different folder
 # at a later date, so change this as needed):
 proj <- "South Thompson"
 kml_dir <- file.path(
-  serv, 
-  "KML Flight Areas/South Thompson Project Area/overall area")
+  serv,
+  "KML Flight Areas/South Thompson Project Area/overall area"
+)
 fd_dir <- file.path(serv, "Vegetation Data - 2024")
 air_photo_p <- file.path(fd_dir, "Air Photo Interpretation.gpkg")
 f_data_p <- file.path(fd_dir, "Veg Survey data - 2024.xlsx")
 f_pts_p <- list.files(file.path(fd_dir, "Avenza Exports"),
-                    pattern = ".kml$", full.names = TRUE)
+  pattern = ".kml$", full.names = TRUE
+)
 
-air_photo <- st_read(air_photo_p, quiet = TRUE) %>% 
-  janitor::clean_names() %>% 
-  select(-notes) %>% 
+air_photo <- st_read(air_photo_p, quiet = TRUE) %>%
+  janitor::clean_names() %>%
+  select(-notes) %>%
   st_set_agr("constant")
 
-f_data <- read_excel(f_data_p, skip = 2, col_types = "guess") %>% 
-  janitor::clean_names() %>% 
-  drop_na(block) %>% 
-  select(block, avenza_plot_number, cheatgrass) %>% 
-  rename(plot = avenza_plot_number, cover = cheatgrass) %>% 
+f_data <- read_excel(f_data_p, skip = 2, col_types = "guess") %>%
+  janitor::clean_names() %>%
+  drop_na(block) %>%
+  select(block, avenza_plot_number, cheatgrass) %>%
+  rename(plot = avenza_plot_number, cover = cheatgrass) %>%
   mutate(cover = replace_na(cover, 0))
 
 # Read in the field points, provide fix for altered KML file
 f_pts <- do.call(rbind, lapply(f_pts_p, function(x) {
-  
-  if(nrow(st_layers(x)) > 1) {
-    kml1 <- st_read(x, layer = st_layers(x)[2, "name"], quiet = TRUE) %>% 
-      janitor::clean_names() %>% 
-      select(-description) %>% 
-      rename(plot_id = name) %>% 
-      mutate(plot_id = gsub("Block |Blk ", "", plot_id), 
-             plot_id = gsub(" - ", "_", plot_id),
-             plot_id = gsub("_P", "_", plot_id))
-    clean <- cbind(st_drop_geometry(kml1), 
-                   as.data.frame(st_coordinates(kml1))) %>% 
+  if (nrow(st_layers(x)) > 1) {
+    kml1 <- st_read(x, layer = st_layers(x)[2, "name"], quiet = TRUE) %>%
+      janitor::clean_names() %>%
+      select(-description) %>%
+      rename(plot_id = name) %>%
+      mutate(
+        plot_id = gsub("Block |Blk ", "", plot_id),
+        plot_id = gsub(" - ", "_", plot_id),
+        plot_id = gsub("_P", "_", plot_id)
+      )
+    clean <- cbind(
+      st_drop_geometry(kml1),
+      as.data.frame(st_coordinates(kml1))
+    ) %>%
       filter(Z > 0)
-    kml2 <- st_read(x, layer = st_layers(x)[3, "name"], quiet = TRUE) %>% 
-      janitor::clean_names() %>% 
-      select(-description) %>% 
-      rename(plot_id = name) %>% 
-      filter(!grepl("Add", plot_id)) %>% 
-      mutate(plot_id = gsub("Block |Blk ", "", plot_id), 
-             plot_id = gsub(" - ", "_", plot_id),
-             plot_id = gsub("_P", "_", plot_id))
+    kml2 <- st_read(x, layer = st_layers(x)[3, "name"], quiet = TRUE) %>%
+      janitor::clean_names() %>%
+      select(-description) %>%
+      rename(plot_id = name) %>%
+      filter(!grepl("Add", plot_id)) %>%
+      mutate(
+        plot_id = gsub("Block |Blk ", "", plot_id),
+        plot_id = gsub(" - ", "_", plot_id),
+        plot_id = gsub("_P", "_", plot_id)
+      )
     kml <- rbind(
       kml1 %>% filter(plot_id %in% clean$plot_id),
-      kml2)
+      kml2
+    )
   } else {
-    kml <- st_read(x, quiet = TRUE) %>% 
-      janitor::clean_names() %>% 
-      select(-description) %>% 
-      rename(plot_id = name) %>% 
-      filter(startsWith(plot_id, "Block")) %>% 
-      mutate(plot_id = gsub("Block ", "", plot_id),
-             plot_id = gsub("_P", "_", plot_id))
+    kml <- st_read(x, quiet = TRUE) %>%
+      janitor::clean_names() %>%
+      select(-description) %>%
+      rename(plot_id = name) %>%
+      filter(startsWith(plot_id, "Block")) %>%
+      mutate(
+        plot_id = gsub("Block ", "", plot_id),
+        plot_id = gsub("_P", "_", plot_id)
+      )
   }
-  if(!st_geometry_type(kml, by_geometry = FALSE) == "POINT") {
+  if (!st_geometry_type(kml, by_geometry = FALSE) == "POINT") {
     kml <- kml %>% st_collection_extract("POINT")
   }
-  
+
   clean <- cbind(st_drop_geometry(kml), as.data.frame(st_coordinates(kml)))
-  if(nrow(st_layers(x)) == 1) clean <- filter(clean, Z > 0)
-  kml_clean <- kml %>% 
-    filter(plot_id %in% clean$plot_id) %>% 
-    separate_wider_delim(plot_id, "_", names = c("block", "plot")) %>% 
-    st_as_sf() %>% 
+  if (nrow(st_layers(x)) == 1) clean <- filter(clean, Z > 0)
+  kml_clean <- kml %>%
+    filter(plot_id %in% clean$plot_id) %>%
+    separate_wider_delim(plot_id, "_", names = c("block", "plot")) %>%
+    st_as_sf() %>%
     mutate(across(c(block, plot), as.numeric),
       surveyor = gsub(
-      "AuroraUAV_2024_SamplePts_", "", gsub(".kml", "", basename(x))), 
-      .after = plot) %>% 
-    st_zm() %>% 
+        "AuroraUAV_2024_SamplePts_", "", gsub(".kml", "", basename(x))
+      ),
+      .after = plot
+    ) %>%
+    st_zm() %>%
     st_transform(st_crs(air_photo))
 }))
 
 # Bind field data to field points:
-fd <- left_join(f_pts, f_data, by = c("block", "plot")) %>% 
-  relocate(block, plot, surveyor, cover) %>% 
+fd <- left_join(f_pts, f_data, by = c("block", "plot")) %>%
+  relocate(block, plot, surveyor, cover) %>%
   mutate(presence = cover > 0, .after = cover)
 
 # Missing data - field data present but no associated point
 # Assume missing point data came from Grant
-missing_fpts <- left_join(f_data, f_pts, by = c("block", "plot")) %>% 
-  st_drop_geometry() %>% 
-  select(-geometry) %>% 
-  filter(is.na(surveyor)) %>% 
-  mutate(plot_id = paste0(block, "_", plot),
-         surveyor = "Grant",
-         presence = cover > 0, .after = cover)
+missing_fpts <- left_join(f_data, f_pts, by = c("block", "plot")) %>%
+  st_drop_geometry() %>%
+  select(-geometry) %>%
+  filter(is.na(surveyor)) %>%
+  mutate(
+    plot_id = paste0(block, "_", plot),
+    surveyor = "Grant",
+    presence = cover > 0, .after = cover
+  )
 
 # Help with missing data - add spatial points to those
-fd_missing <- st_read(f_pts_p[1], quiet = TRUE) %>% 
-  janitor::clean_names() %>% 
-  select(-description) %>% 
-  rename(plot_id = name) %>% 
-  filter(startsWith(plot_id, "Block")) %>% 
-  mutate(plot_id = gsub("Block ", "", plot_id),
-         plot_id = gsub("_P", "_", plot_id)) %>% 
-  filter(plot_id %in% missing_fpts$plot_id) %>% 
-  st_zm() %>% 
+fd_missing <- st_read(f_pts_p[1], quiet = TRUE) %>%
+  janitor::clean_names() %>%
+  select(-description) %>%
+  rename(plot_id = name) %>%
+  filter(startsWith(plot_id, "Block")) %>%
+  mutate(
+    plot_id = gsub("Block ", "", plot_id),
+    plot_id = gsub("_P", "_", plot_id)
+  ) %>%
+  filter(plot_id %in% missing_fpts$plot_id) %>%
+  st_zm() %>%
   st_transform(st_crs(air_photo))
 
-fd_missing_join <- left_join(missing_fpts, fd_missing, by = "plot_id") %>% 
-  select(-plot_id) %>% 
+fd_missing_join <- left_join(missing_fpts, fd_missing, by = "plot_id") %>%
+  select(-plot_id) %>%
   st_sf()
 
 # Combine the field data and fixed missing data
-fd <- rbind(fd, fd_missing_join) %>% 
+fd <- rbind(fd, fd_missing_join) %>%
   arrange(block, plot)
 
 # Missing data - no field data, but there is a point from that survey
-missing_fdata <- filter(fd, is.na(cover)) %>% 
+missing_fdata <- filter(fd, is.na(cover)) %>%
   st_drop_geometry()
 write.csv(missing_fdata, file.path(fd_dir, "missing.csv"), row.names = FALSE)
 
 # Create a single large dataset for raster extraction in next chunk
 # Set block to be the from the flight area polygons instead
 sample_blocks <- file.path(kml_dir, "South Thompson Project Area - 2024.kml")
-sample_polys <- st_read(sample_blocks, quiet = TRUE) %>% 
-  st_zm() %>% 
-  rename(block = Name) %>% 
-  select(block) %>% 
-  filter(!block %in% "South Thompson Project Area") %>% 
-  mutate(block = as.numeric(block)) %>% 
-  st_transform(st_crs(air_photo)) %>% 
+sample_polys <- st_read(sample_blocks, quiet = TRUE) %>%
+  st_zm() %>%
+  rename(block = Name) %>%
+  select(block) %>%
+  filter(!block %in% "South Thompson Project Area") %>%
+  mutate(block = as.numeric(block)) %>%
+  st_transform(st_crs(air_photo)) %>%
   st_set_agr("constant")
 
 fd_full <- rbind(
   fd %>% select(cover, presence) %>% filter(!is.na(cover)),
-  air_photo %>% mutate(cover = NA)) %>% 
-  mutate(block = sample_polys$block[st_nearest_feature(., sample_polys)],
-         .before = cover) %>% 
+  air_photo %>% mutate(cover = NA)
+) %>%
+  mutate(
+    block = sample_polys$block[st_nearest_feature(., sample_polys)],
+    .before = cover
+  ) %>%
   arrange(block, presence, cover)
 
 # Create blocks used for blocking in mlr3 (next script)
 # Ensure that each block has a minimum of 5 observations of one presence/absence:
 fd_check <- lapply(unique(fd_full$block), function(x) {
-  table(fd_full %>% 
-    filter(block == x) %>% 
+  table(fd_full %>%
+    filter(block == x) %>%
     pull(presence))
 }) %>% setNames(unique(fd_full$block))
 
@@ -191,45 +213,46 @@ fd_check2 <- sapply(fd_check, function(x) {
   !(length(x) == 2 && all(x >= 5))
 })
 
-fd_fix <- fd_full %>% 
+fd_fix <- fd_full %>%
   filter(!block %in% as.numeric(names(fd_check2[fd_check2])))
-fd_unfull <- fd_full %>% 
+fd_unfull <- fd_full %>%
   filter(block %in% as.numeric(names(fd_check2[fd_check2])))
-while(any(fd_check2)) {
-  
-  fd_unfull <- fd_unfull %>% 
+while (any(fd_check2)) {
+  fd_unfull <- fd_unfull %>%
     mutate(block = ifelse(block %in% as.numeric(names(fd_check2[fd_check2]))[-1],
-                          block - 1, block))
-  
+      block - 1, block
+    ))
+
   fd_check <- lapply(unique(fd_unfull$block), function(x) {
-    table(fd_unfull %>% 
-            filter(block == x) %>% 
-            pull(presence))
+    table(fd_unfull %>%
+      filter(block == x) %>%
+      pull(presence))
   }) %>% setNames(unique(fd_unfull$block))
-  
-  if(length(fd_check) == 0) {
+
+  if (length(fd_check) == 0) {
     fd_check2 <- FALSE
   } else {
     fd_check2 <- sapply(fd_check, function(x) {
       !(length(x) == 2 && all(x >= 5))
     })
   }
-  
-  if(length(fd_check2) <= 3) {
+
+  if (length(fd_check2) <= 3) {
     fd_unfull$block <- as.numeric(names(fd_check)[1])
   }
-    
+
   fd_fix <- rbind(
     fd_fix,
-    fd_unfull %>% filter(!block %in% as.numeric(names(fd_check2[fd_check2]))))
-  fd_unfull <- fd_unfull %>% 
+    fd_unfull %>% filter(!block %in% as.numeric(names(fd_check2[fd_check2])))
+  )
+  fd_unfull <- fd_unfull %>%
     filter(block %in% as.numeric(names(fd_check2[fd_check2])))
 }
 
 fd_check <- lapply(unique(fd_fix$block), function(x) {
-    table(fd_fix %>% 
-            filter(block == x) %>% 
-            pull(presence))
+  table(fd_fix %>%
+    filter(block == x) %>%
+    pull(presence))
 }) %>% setNames(unique(fd_fix$block))
 
 fd_final <- vect(fd_fix)
@@ -254,11 +277,11 @@ covs_data <- minmax(covs, compute = TRUE)
 covs <- covs[[which(covs_data[2, ] - covs_data[1, ] > 0)]]
 
 # Determine layers to remove: ones with more NA data compared to other layers
-covs_no_na <- global(covs, fun = "isNA") %>% 
-  as.data.frame() %>% 
-  rownames_to_column("layer") %>% 
-  filter(isNA > 0) %>% 
-  filter(isNA < quantile(isNA, prob = 0.98)) %>% 
+covs_no_na <- global(covs, fun = "isNA") %>%
+  as.data.frame() %>%
+  rownames_to_column("layer") %>%
+  filter(isNA > 0) %>%
+  filter(isNA < quantile(isNA, prob = 0.98)) %>%
   pull(layer)
 covs <- covs[[covs_no_na]]
 
@@ -268,11 +291,11 @@ corr <- cormat$correlation
 
 # P-values tell us the likelihood that two variables are correlated
 cortest <- cor.mtest(corr)
-cm <- as.data.frame(cortest$p) %>% 
-  mutate(across(everything(), ~.x > 0.05))
+cm <- as.data.frame(cortest$p) %>%
+  mutate(across(everything(), ~ .x > 0.05))
 
 # only need the "top half" of the data for rowsums calculation
-for(x in 1:ncol(cm)) {
+for (x in 1:ncol(cm)) {
   cm[x:nrow(cm), x] <- FALSE
 }
 cm$ncorrelated <- rowSums(cm)
@@ -280,30 +303,35 @@ cm$ncorrelated <- rowSums(cm)
 # Select variables that are at are not correlated with at
 # least half plus 1 of the other variables
 cm <- cm %>%
-  filter(ncorrelated <= (floor(nlyr(covs) / 2) + 1)) %>% 
-  rownames_to_column() %>% 
+  filter(ncorrelated <= (floor(nlyr(covs) / 2) + 1)) %>%
+  rownames_to_column() %>%
   pull(rowname)
 covs <- covs[[cm]]
 
 # Perform data extraction
-cov_extract <- extract(covs, fd_final, bind = TRUE) %>% 
-  na.omit(field = names(covs)) %>% 
+cov_extract <- extract(covs, fd_final, bind = TRUE) %>%
+  na.omit(field = names(covs)) %>%
   st_as_sf()
 
 # Separate datasets for the different models
 cheat_pres <- select(cov_extract, -cover)
-cheat_cover <- cov_extract %>% 
-  mutate(cover = ifelse(!presence, 0, cover)) %>% 
-  filter(!is.na(cover)) %>% 
+cheat_cover <- cov_extract %>%
+  mutate(cover = ifelse(!presence, 0, cover)) %>%
+  filter(!is.na(cover)) %>%
   select(-presence)
 
 # Write outputs - these will get used in the next script.
 fd_out <- file.path(serv, "Modelling/Field Data", proj, paste0(
-  proj, "_modelling_data.gpkg"))
+  proj, "_modelling_data.gpkg"
+))
 del <- file.exists(fd_out)
-st_write(cheat_pres, fd_out, layer = "presence", 
-         delete_dsn = FALSE, delete_layer = del, quiet = TRUE)
-st_write(cheat_cover, fd_out, layer = "cover", 
-         delete_dsn = FALSE, delete_layer = del, quiet = TRUE)
+st_write(cheat_pres, fd_out,
+  layer = "presence",
+  delete_dsn = FALSE, delete_layer = del, quiet = TRUE
+)
+st_write(cheat_cover, fd_out,
+  layer = "cover",
+  delete_dsn = FALSE, delete_layer = del, quiet = TRUE
+)
 
 ```

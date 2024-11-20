@@ -2,7 +2,7 @@
 title: "ST_02_Predictor Layers"
 author: "Matthew Coghill"
 format: html
-editor: visual
+editor: source
 ---
 
 # South Thompson - Predictor Layer Generation
@@ -17,18 +17,22 @@ The first step in this process involves loading the required packages. Some base
 
 ```{r init, include=FALSE}
 
-ls <- c("tidyverse", "terra", "lidR", "lasR", "Rsagacmd", "ClimateNAr",
-        "RStoolbox", "future.apply")
+ls <- c(
+  "tidyverse", "terra", "lidR", "lasR", "Rsagacmd", "ClimateNAr",
+  "RStoolbox", "future.apply"
+)
 invisible(suppressPackageStartupMessages(
-  lapply(ls, library, character.only = TRUE)))
+  lapply(ls, library, character.only = TRUE)
+))
 rm(ls)
 
 # Here, I set some memory options that allow for larger files to be stored in
 # memory (allows for faster processing):
 mem <- as.numeric(
-  system("awk '/MemTotal/ {print $2}' /proc/meminfo", intern = TRUE))
+  system("awk '/MemTotal/ {print $2}' /proc/meminfo", intern = TRUE)
+)
 terra_orig <- terraOptions(print = FALSE)
-terraOptions(memfrac = 0.8, memmin = round((mem / 1024 / 1024) * (3/4)))
+terraOptions(memfrac = 0.8, memmin = round((mem / 1024 / 1024) * (3 / 4)))
 
 # Start SAGA GIS 9.6.1
 saga_path <- "C:/SAGA-GIS/saga-9.6.1_x64/saga_cmd.exe"
@@ -37,7 +41,7 @@ saga <- saga_gis(saga_path, raster_format = "GeoTIFF", all_outputs = FALSE)
 # Start over? Warning: deletes everything from main layer folder.
 sanitize <- TRUE
 
-# Set file access either over SFTP connection, Local LAN, or through the 
+# Set file access either over SFTP connection, Local LAN, or through the
 # Synology Drive app (i.e.: "SFTP", "Local", "SynologyDrive", or whatever the
 # folder name is for your Synology Drive app location)
 serv_conn <- "Synology"
@@ -58,14 +62,16 @@ Additionally, this chunk will ensure that the KML/KMZ files (i.e.: flight bounda
 ```{r Directories, include=FALSE}
 
 # Determine server directory method (change username if using SFTP connection)
-if(serv_conn == "SFTP") {
+if (serv_conn == "SFTP") {
   user <- "mcoghill"
   serv <- paste0("//", user, "@aurorauav.synology.me/Cheatgrass")
-} else if(serv_conn == "Local") {
+} else if (serv_conn == "Local") {
   serv <- "//AuroraNAS/Cheatgrass"
-} else if(serv_conn == "Synology") {
+} else if (serv_conn == "Synology") {
   serv <- file.path(Sys.getenv("USERPROFILE"), "SynologyDrive/Cheatgrass")
-} else serv <- serv_conn
+} else {
+  serv <- serv_conn
+}
 
 # Initialize directories
 proj <- "South Thompson"
@@ -75,24 +81,33 @@ tile_dir <- file.path(tempdir(), "01_LAS")
 dtm_dir <- file.path(tempdir(), "02_DTM")
 clm_dir <- file.path(tempdir(), "03_Climate")
 ms_dir <- file.path(tempdir(), "04_Multispectral")
-if(dir.exists(layr_dir) && sanitize) unlink(layr_dir, recursive = TRUE)
+if (dir.exists(layr_dir) && sanitize) unlink(layr_dir, recursive = TRUE)
 dir.create(layr_dir, showWarnings = FALSE)
 invisible(
   sapply(c(tile_dir, dtm_dir, clm_dir, ms_dir),
-         dir.create, showWarnings = FALSE))
+    dir.create,
+    showWarnings = FALSE
+  )
+)
 
-# Each folder with a KMZ file will be used to process LAS files (i.e.: all RGB 
+# Each folder with a KMZ file will be used to process LAS files (i.e.: all RGB
 # based projects) or multispectral files (i.e.: reflectance images).
 kmz_files <- list.files(
-  proc_dir, pattern = ".kmz$|.kml$", full.names = TRUE, recursive = TRUE)
+  proc_dir,
+  pattern = ".kmz$|.kml$", full.names = TRUE, recursive = TRUE
+)
 kmz_files_noext <- gsub(".kml$|.kmz$", "", kmz_files)
 kmz_files <- kmz_files[!duplicated(kmz_files_noext)]
 rgb_las_files <- list.files(
-  proc_dir, pattern = "group1_densified_point_cloud.las$", 
-  full.names = TRUE, recursive = TRUE)
+  proc_dir,
+  pattern = "group1_densified_point_cloud.las$",
+  full.names = TRUE, recursive = TRUE
+)
 refl_dirs <- dir(
-  proc_dir, pattern = "Reflectance$", full.names = TRUE, recursive = TRUE, 
-  include.dirs = TRUE)
+  proc_dir,
+  pattern = "Reflectance$", full.names = TRUE, recursive = TRUE,
+  include.dirs = TRUE
+)
 
 # Filter RGB LAS files and MS dirs based on KMZ file presence
 rgb_las_files <- rgb_las_files[dirname(rgb_las_files) %in% dirname(kmz_files)]
@@ -100,12 +115,14 @@ refl_dirs <- refl_dirs[dirname(refl_dirs) %in% dirname(kmz_files)]
 
 # Unzip KMZ to KML
 flights <- do.call(c, lapply(kmz_files, function(x) {
-  if(endsWith(x, "kmz")) {
+  if (endsWith(x, "kmz")) {
     kml_id <- grep(".kml$", unzip(x, list = TRUE)[, "Name"], value = TRUE)
     kml <- file.path(dirname(x), sub(".kmz$", ".kml", basename(x)))
     unzip(x, files = kml_id, exdir = dirname(x))
     file.rename(file.path(dirname(x), kml_id), kml)
-  } else kml <- x
+  } else {
+    kml <- x
+  }
   return(kml)
 }))
 
@@ -118,25 +135,26 @@ kml_ms <- kml_ms[!endsWith(kml_ms, "_RGB.kml")]
 # Filter RGB LAS files and MS dirs based on KML file presence and names
 rgb_las_files <- rgb_las_files[dirname(rgb_las_files) %in% dirname(kml_rgb)]
 refl_dirs <- refl_dirs[dirname(refl_dirs) %in% dirname(kml_ms)]
-rgb_df <- data.frame(rgb = rgb_las_files) %>% 
-  rowwise() %>% 
-  mutate(kml = kml_rgb[which(dirname(kml_rgb) == dirname(rgb))]) %>% 
-  ungroup() %>% 
+rgb_df <- data.frame(rgb = rgb_las_files) %>%
+  rowwise() %>%
+  mutate(kml = kml_rgb[which(dirname(kml_rgb) == dirname(rgb))]) %>%
+  ungroup() %>%
   mutate(flight = sapply(strsplit(basename(rgb), "_"), "[[", 1))
-ms_df <- data.frame(ms = refl_dirs) %>% 
-  rowwise() %>% 
-  mutate(kml = kml_ms[which(dirname(kml_ms) == dirname(ms))]) %>% 
-  ungroup() %>% 
+ms_df <- data.frame(ms = refl_dirs) %>%
+  rowwise() %>%
+  mutate(kml = kml_ms[which(dirname(kml_ms) == dirname(ms))]) %>%
+  ungroup() %>%
   mutate(flight = sapply(strsplit(basename(dirname(ms)), "_"), "[[", 1))
 
 # Initialize final grid frame
-aoi <- suppressWarnings(vect(paste0(proj, "_AOI.kml"))) %>% 
+aoi <- suppressWarnings(vect(paste0(proj, "_AOI.kml"))) %>%
   project("EPSG:3153")
 aoi_ext <- ext(
   plyr::round_any(xmin(aoi), 25, floor),
   plyr::round_any(xmax(aoi), 25, ceiling),
   plyr::round_any(ymin(aoi), 25, floor),
-  plyr::round_any(ymax(aoi), 25, ceiling))
+  plyr::round_any(ymax(aoi), 25, ceiling)
+)
 aoi_r <- rast(aoi_ext, res = rres, crs = terra::crs(aoi), vals = NA)
 
 ```
@@ -151,56 +169,62 @@ Once a DTM and CHM have been created for a given flight area, mask those layers 
 
 set_lidr_threads(0)
 las_proc <- lapply(seq_len(nrow(rgb_df)), function(x) {
-  
   # Set some file parameters/input/output paths
   y <- pull(rgb_df, rgb)[x]
   kml_file <- pull(rgb_df, kml)[x]
   tile_out <- file.path(tile_dir, strsplit(basename(dirname(y)), "_")[[1]][1])
   dir.create(tile_out, showWarnings = FALSE)
   dtm_raw_out <- file.path(
-    dtm_dir, paste0(strsplit(basename(dirname(y)), "_")[[1]][1], "_DTM_raw.tif"))
+    dtm_dir, paste0(strsplit(basename(dirname(y)), "_")[[1]][1], "_DTM_raw.tif")
+  )
   chm_raw_out <- gsub("_DTM_raw.tif", "_CHM_raw.tif", dtm_raw_out)
   dtm_out <- gsub("_DTM_raw.tif", "_DTM.tif", dtm_raw_out)
   chm_out <- gsub("_CHM_raw.tif", "_CHM.tif", chm_raw_out)
-  
+
   # Create the LAS catalog object for tiling the larger LAS file
   ctg <- readLAScatalog(y, chunk_size = 250, chunk_buffer = 0, progress = FALSE)
   opt_chunk_alignment(ctg) <- c(250, 250)
   opt_output_files(ctg) <- file.path(tile_out, "{XLEFT}_{YBOTTOM}")
   ctg_tile <- catalog_retile(ctg)
   lidR:::catalog_laxindex(ctg_tile)
-  
-  # The point clouds provided have been classifed already, so first just 
+
+  # The point clouds provided have been classifed already, so first just
   # classify noise, and then filter out the noise using the triangulation stage,
   # then produce the DTM and CHM which would use the filtered point cloud
   # classified already, so just produce the DTM from those classified point clouds
   ivf_pipe <- classify_with_ivf()
   tin_pipe <- triangulate(
-    filter = "-keep_class 2 9 -drop_class 18 -drop_z_below 0", ofile = "")
+    filter = "-keep_class 2 9 -drop_class 18 -drop_z_below 0", ofile = ""
+  )
   dtm_pipe <- lasR::rasterize(res = rres, tin_pipe, ofile = dtm_raw_out)
   norm_pipe <- transform_with(tin_pipe)
   chm_pipe <- lasR::rasterize(
-    res = rres, operators = "max", filter = "-drop_z_below 0", ofile = "")
+    res = rres, operators = "max", filter = "-drop_z_below 0", ofile = ""
+  )
   pf_pipe <- pit_fill(chm_pipe, ofile = chm_raw_out)
   pipeline <- ivf_pipe + tin_pipe + dtm_pipe + norm_pipe + chm_pipe + pf_pipe
   set_parallel_strategy(nested(ncores() %/% 4L, 4L))
   dtm_chm_raw <- exec(pipeline, on = tile_out, progress = TRUE)
   dtm_chm_raw <- c(dtm_chm_raw[[1]], dtm_chm_raw[[2]])
   names(dtm_chm_raw) <- paste0(
-    strsplit(basename(dirname(y)), "_")[[1]][1], c("_DTM", "_CHM"))
-  
+    strsplit(basename(dirname(y)), "_")[[1]][1], c("_DTM", "_CHM")
+  )
+
   # Mask the CHM and DTM to the flight area provided by the KML files
-  kml <- suppressWarnings(vect(kml_file, what = "geoms")) %>% 
+  kml <- suppressWarnings(vect(kml_file, what = "geoms")) %>%
     project(terra::crs(dtm_chm_raw))
-  dtm_chm <- mask(dtm_chm_raw, kml) %>% 
+  dtm_chm <- mask(dtm_chm_raw, kml) %>%
     writeRaster(
-      filename = c(dtm_out, chm_out), overwrite = TRUE, 
-      names = names(.))
+      filename = c(dtm_out, chm_out), overwrite = TRUE,
+      names = names(.)
+    )
 })
 
 # Cleanup
-raw_dtms <- list.files(dtm_dir, pattern = "_DTM_raw.tif$|_CHM_raw.tif$",
-                       full.names = TRUE)
+raw_dtms <- list.files(dtm_dir,
+  pattern = "_DTM_raw.tif$|_CHM_raw.tif$",
+  full.names = TRUE
+)
 unlink(c(raw_dtms, tile_dir), recursive = TRUE)
 rm(raw_dtms, tile_dir)
 
@@ -215,20 +239,20 @@ Next, mosaic the DTM and CHM images together. We make use of a "match" parameter
 # Define input file lists, and then mosaic
 dtm_chm_list <- do.call(c, lapply(las_proc, sources))
 dtm_chm_mos <- do.call(c, lapply(c("DTM", "CHM"), function(x) {
-  
   # Write a list of tif files in a text file to be read by SAGA GIS for mosaicking
   file_list <- grep(paste0("_", x, ".tif$"), dtm_chm_list, value = TRUE)
   write(file_list, file = file.path(tempdir(), paste0(x, "_file_list.txt")))
   rast_mosaic <- saga$grid_tools$mosaicking(
-    target_out_grid = file.path(layr_dir, paste0(x, ".tif")), 
+    target_out_grid = file.path(layr_dir, paste0(x, ".tif")),
     target_definition = 1,
-    target_template = aoi_r, 
+    target_template = aoi_r,
     file_list = file.path(tempdir(), paste0(x, "_file_list.txt")),
     overlap = 5,
     blend_dist = 15,
     blend_bnd = 0,
-    match = ifelse(x == "DTM", 3, 0))
-  
+    match = ifelse(x == "DTM", 3, 0)
+  )
+
   return(rast_mosaic)
 }))
 
@@ -248,19 +272,23 @@ It is quicker and more memory efficient to generate climate layers by flight are
 # to attempt to closely match the weather conditions from the flights conducted.
 
 dtm_df <- data.frame(
-  dtm = list.files(dtm_dir, pattern = "_DTM.tif$", full.names = TRUE)) %>% 
+  dtm = list.files(dtm_dir, pattern = "_DTM.tif$", full.names = TRUE)
+) %>%
   mutate(flight = sapply(
-    strsplit(basename(dtm), "_"), function(x) x[-length(x)])) %>% 
+    strsplit(basename(dtm), "_"), function(x) x[-length(x)]
+  )) %>%
   left_join(rgb_df, by = "flight")
 pl <- c("Year_2023.ann")
 vl <- paste0(c(
   "Tave", "Tmax", "Tmin", "PPT", "Rad", "DD_0", "DD5", "DD_18", "DD18", "DD1040",
-  "NFFD", "PAS", "Eref", "CMD", "RH", "CMI"), "_sm")
+  "NFFD", "PAS", "Eref", "CMD", "RH", "CMI"
+), "_sm")
 
 # Create a variable indicating which variables are integer types
 int_ids <- paste0(c(
   "PPT", "DD_0", "DD5", "DD_18", "DD18", "DD1040", "NFFD", "PAS", "Eref", "CMD",
-  "RH"), "_sm")
+  "RH"
+), "_sm")
 
 # Generate climate variables by flight area. This will save memory and time
 # compared to generating climate variables for the entire area.
@@ -269,64 +297,76 @@ clm_par <- future_lapply(seq_len(nrow(dtm_df)), function(x) {
   y <- pull(dtm_df, dtm)[x]
   clm_subdir <- file.path(clm_dir, gsub(".tif", "", basename(y)))
   dir.create(clm_subdir, showWarnings = FALSE)
-  
+
   kml_file <- pull(dtm_df, kml)[x]
-  
+
   # First, project DTM to required lat/long format
   dtm_bca <- rast(y)
-  dtm_wgs <- dtm_bca %>% 
+  dtm_wgs <- dtm_bca %>%
     project("EPSG:4326", threads = FALSE, filename = file.path(
-      tempdir(), basename(y)), overwrite = TRUE)
-  
-  # Set input and output paths. Output path must include trailing "/". 
+      tempdir(), basename(y)
+    ), overwrite = TRUE)
+
+  # Set input and output paths. Output path must include trailing "/".
   # The outputs will be in Lat/Long, so save to temporary directory first.
   dtm_in <- sources(dtm_wgs)
   clm_dest <- file.path(tempdir(), "ClimateBC_Layers", "/")
   dir.create(clm_dest, showWarnings = FALSE)
-  
+
   # Run the function to generate desired climate variables. This will take some
   # time, but will generate .tif files for each variable it outputs.
   clm <- climateNAr(dtm_in, periodList = pl, varList = vl, outDir = clm_dest)
   clm <- rast(list.files(paste0(clm_dest, gsub(".tif", "", basename(dtm_in))),
-                          recursive = TRUE, pattern = ".tif$", full.names = TRUE))
-  
+    recursive = TRUE, pattern = ".tif$", full.names = TRUE
+  ))
+
   # Reprojection and masking: don't save outputs here, keep these in memory!
-  # Select and reproject integer based layers back to the base DEM extent and 
+  # Select and reproject integer based layers back to the base DEM extent and
   # resolution using the nearest neighbour method
-  kml <- suppressWarnings(vect(kml_file, what = "geoms")) %>% 
+  kml <- suppressWarnings(vect(kml_file, what = "geoms")) %>%
     project(terra::crs(dtm_bca))
-  
+
   clm_int <- clm[[which(names(clm) %in% int_ids)]]
   clm_int_bca <- project(
-    clm_int, dtm_bca, threads = FALSE, method = "near") %>% 
+    clm_int, dtm_bca,
+    threads = FALSE, method = "near"
+  ) %>%
     mask(kml)
-  
-  # Select and reproject numeric based layers back to the base DEM extent and 
+
+  # Select and reproject numeric based layers back to the base DEM extent and
   # resolution using the bilnear interpolation method
   clm_num <- clm[[which(!names(clm) %in% int_ids)]]
   clm_num_bca <- project(
-    clm_num, dtm_bca, threads = FALSE, method = "bilinear") %>% 
+    clm_num, dtm_bca,
+    threads = FALSE, method = "bilinear"
+  ) %>%
     mask(kml)
-  
+
   # Ideally, the objects above are stored in memory. Give the SpatRaster layers
   # more descriptive names.
   names(clm_int_bca) <- paste0(
     "Climate_", basename(dirname(sources(clm_int))), "_",
-    gsub(".tif", "", basename(sources(clm_int))))
+    gsub(".tif", "", basename(sources(clm_int)))
+  )
   names(clm_num_bca) <- paste0(
     "Climate_", basename(dirname(sources(clm_num))), "_",
-    gsub(".tif", "", basename(sources(clm_num))))
-  
+    gsub(".tif", "", basename(sources(clm_num)))
+  )
+
   # Write each raster out to the climate variable folder and subfolder. Again,
-  # hopefully this is all done in memory to save time when writing each raster 
+  # hopefully this is all done in memory to save time when writing each raster
   # to a file.
   clm_int_bca <- writeRaster(clm_int_bca, file.path(
-    clm_subdir, paste0(names(clm_int_bca), ".tif")),
-    datatype = "INT2S", overwrite = TRUE)
+    clm_subdir, paste0(names(clm_int_bca), ".tif")
+  ),
+  datatype = "INT2S", overwrite = TRUE
+  )
   clm_num_bca <- writeRaster(clm_num_bca, file.path(
-    clm_subdir, paste0(names(clm_num_bca), ".tif")),
-    datatype = "FLT4S", overwrite = TRUE)
-  
+    clm_subdir, paste0(names(clm_num_bca), ".tif")
+  ),
+  datatype = "FLT4S", overwrite = TRUE
+  )
+
   # Clean up files, return file list (required for future_lapply function)
   unlink(sources(clm))
   rm(clm)
@@ -339,14 +379,13 @@ clm_par <- lapply(clm_par, rast)
 # Mosaic the climate layers together, following each layers respective resampling
 # strategy
 clm_mosaics <- do.call(c, lapply(names(clm_par[[1]]), function(x) {
-  
   # Get every one of the rasters based on file names
   clm_var <- lapply(clm_par, "[[", x)
-  
+
   # Change resampling strategy for mosaicking based on data type
   rsmp <- ifelse(datatype(clm_var[[1]]) == "INT2S", 1, 3)
-  
-  # Generate list of variables from the clm_var object, and write this as a 
+
+  # Generate list of variables from the clm_var object, and write this as a
   # text file for SAGA GIS.
   clm_list <- sapply(clm_var, sources, USE.NAMES = FALSE)
   write(clm_list, file = file.path(tempdir(), paste0(x, "_file_list.txt")))
@@ -354,13 +393,14 @@ clm_mosaics <- do.call(c, lapply(names(clm_par[[1]]), function(x) {
     target_out_grid = file.path(layr_dir, paste0(x, ".tif")),
     file_list = file.path(tempdir(), paste0(x, "_file_list.txt")),
     target_definition = 1,
-    target_template = aoi_r, 
+    target_template = aoi_r,
     resampling = rsmp,
     overlap = 5,
     blend_dist = 15,
     blend_bnd = 0,
-    match = 0) 
-  
+    match = 0
+  )
+
   return(clm_mosaic)
 }))
 
@@ -379,7 +419,6 @@ Multispectral indices are generated from reflectance layers (i.e.: blue, green, 
 # Could potentially be in future_lapply loop instead.
 plan(multisession, workers = ncores() %/% 2)
 ms_lowres <- future_lapply(seq_len(nrow(ms_df)), function(x) {
-  
   # Define inputs and outputs
   y <- pull(ms_df, ms)[x]
   flight_id <- pull(ms_df, flight)[x]
@@ -387,26 +426,26 @@ ms_lowres <- future_lapply(seq_len(nrow(ms_df)), function(x) {
   r_files <- list.files(y, pattern = ".tif$", full.names = TRUE)
   r_files <- grep("_lwir.tif$", r_files, value = TRUE, invert = TRUE)
   r <- rast(r_files)
-  
+
   # The names that are created from the reflectance directories are too long;
   # rename these layers so that they are more simply their band ID's
   r_names <- strsplit(names(r), "_")
   r_names <- sapply(r_names, function(y) y[length(y)])
   names(r) <- r_names
-  
-  # Create output directory for the flight, and a dummy raster which will be 
+
+  # Create output directory for the flight, and a dummy raster which will be
   # used to downsample the reflectance layers to
   r_out_dir <- file.path(ms_dir, flight_id)
   r_out <- file.path(r_out_dir, paste0(r_names, ".tif"))
   dir.create(r_out_dir, showWarnings = FALSE)
-  kml <- suppressWarnings(vect(kml_file, what = "geoms")) %>% 
+  kml <- suppressWarnings(vect(kml_file, what = "geoms")) %>%
     project(terra::crs(r))
   dummy <- rast(ext(r), crs = terra::crs(r), res = rres)
-  
-  # Resample to lower resolution using the "cubicspline" method, then mask the 
+
+  # Resample to lower resolution using the "cubicspline" method, then mask the
   # raster to the flight area, then write each layer to its own file
-  rr <- resample(r, dummy, method = "cubicspline", threads = FALSE) %>% 
-    mask(kml) %>% 
+  rr <- resample(r, dummy, method = "cubicspline", threads = FALSE) %>%
+    mask(kml) %>%
     writeRaster(r_out, overwrite = TRUE)
   return(sources(rr))
 }, future.seed = NULL)
@@ -415,14 +454,13 @@ ms_lowres <- lapply(ms_lowres, rast)
 
 # Mosaic each band together
 bands_mos <- do.call(c, lapply(names(ms_lowres[[1]]), function(x) {
-  
   # Create the output file path for the merged bands
   band_out <- file.path(ms_dir, "Bands")
   dir.create(band_out, showWarnings = FALSE)
-  
+
   # Get each of the rasters based on the layer name (e.g.: all blue rasters)
   band <- lapply(ms_lowres, "[[", x)
-  
+
   # Generate the list of files that will be mosaicked and write them to a text
   # file for SAGA GIS to use.
   band_list <- sapply(band, sources, USE.NAMES = FALSE)
@@ -431,21 +469,24 @@ bands_mos <- do.call(c, lapply(names(ms_lowres[[1]]), function(x) {
     target_out_grid = file.path(band_out, paste0(x, ".tif")),
     file_list = file.path(tempdir(), paste0(x, "_file_list.txt")),
     target_definition = 1,
-    target_template = aoi_r, 
+    target_template = aoi_r,
     overlap = 5,
     blend_dist = 15,
     blend_bnd = 0,
-    match = 0) 
-  
+    match = 0
+  )
+
   return(band_mosaic)
 }))
 
 # Generate spectral indices
 s <- spectralIndices(
-  img = bands_mos, blue = "blue", green = "green", red = "red", nir = "nir", 
-  redEdge2 = "red edge") %>% 
+  img = bands_mos, blue = "blue", green = "green", red = "red", nir = "nir",
+  redEdge2 = "red edge"
+) %>%
   writeRaster(file.path(layr_dir, paste0("MS_", names(.), ".tif")),
-              overwrite = TRUE)
+    overwrite = TRUE
+  )
 
 # Cleanup
 unlink(ms_dir, recursive = TRUE)
@@ -480,27 +521,31 @@ ta_basic <- saga$ta_compound$basic_terrain_analysis(
   chnl_dist = paste0(od, "chnl_dist.tif"),
   vall_depth = paste0(od, "valley_depth.tif"),
   rsp = paste0(od, "relative_slope_position.tif"),
-  .verbose = TRUE)
+  .verbose = TRUE
+)
 ta_basic <- do.call(c, unname(ta_basic))
-dtmp <- sum(dtm, ta_basic[["sinks"]], na.rm = TRUE, 
-            filename = file.path(tempdir(), "DTM-preproc.tif"),
-            overwrite = TRUE, wopt = list(names = "DTM-preproc"))
+dtmp <- sum(dtm, ta_basic[["sinks"]],
+  na.rm = TRUE,
+  filename = file.path(tempdir(), "DTM-preproc.tif"),
+  overwrite = TRUE, wopt = list(names = "DTM-preproc")
+)
 ta_basic <- ta_basic[[-which(names(ta_basic) == "sinks")]]
 
 # Use custom made toolchain to get more terrain layers:
 ta_custom <- saga$ta_morphometry$custom_toolchain(
   dem = dtmp, t_slope = mrvbf_param,
   mrvbf = paste0(od, "mrvbf.tif"),
-  mrrtf = paste0(od, "mrrtf.tif"), 
+  mrrtf = paste0(od, "mrrtf.tif"),
   dah = paste0(od, "dah.tif"),
-  tpi = paste0(od, "tpi.tif"), 
+  tpi = paste0(od, "tpi.tif"),
   tri = paste0(od, "tri.tif"),
   pos = paste0(od, "openness_pos.tif"),
   neg = paste0(od, "openness_neg.tif"),
   direct = paste0(od, "insolation_direct.tif"),
-  diffuse = paste0(od, "insolation_diffuse.tif"), 
+  diffuse = paste0(od, "insolation_diffuse.tif"),
   location = 1, period = 2, day = "2024-07-30", day_stop = "2024-10-08",
-  days_step = 14, .verbose = TRUE)
+  days_step = 14, .verbose = TRUE
+)
 ta_custom <- do.call(c, unname(ta_custom))
 
 # Sanity check for ensuring things line up properly:

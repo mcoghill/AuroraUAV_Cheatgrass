@@ -2,7 +2,7 @@
 title: "ST_01_South Thompson Sampling"
 author: "Matthew Coghill" 
 format: html
-editor: visual
+editor: source
 ---
 
 # Field sampling
@@ -13,17 +13,20 @@ First, load the required packages
 
 ```{r init, include=FALSE}
 
-ls <- c("tidyverse", "sf", "terra", "raster", "bcmaps", "bcdata", "Rsagacmd",
-        "clhs")
+ls <- c(
+  "tidyverse", "sf", "terra", "raster", "bcmaps", "bcdata", "Rsagacmd",
+  "clhs"
+)
 invisible(suppressPackageStartupMessages(
-  lapply(ls, library, character.only = TRUE)))
+  lapply(ls, library, character.only = TRUE)
+))
 rm(ls)
 
 # Start SAGA GIS 9.6.1
 saga_path <- "C:/SAGA-GIS/saga-9.6.1_x64/saga_cmd.exe"
 saga <- saga_gis(saga_path, raster_format = "GeoTIFF", all_outputs = FALSE)
 
-# Set file access either over SFTP connection, Local LAN, or through the 
+# Set file access either over SFTP connection, Local LAN, or through the
 # Synology Drive app (i.e.: "SFTP", "Local", "SynologyDrive", or whatever the
 # folder name is for your Synology Drive app location)
 serv_conn <- "Synology"
@@ -37,51 +40,54 @@ Below, we set up the files that will be used for downloading external layers and
 ```{r layer_prep, include=FALSE}
 
 # Determine server directory method (change username if using SFTP connection)
-if(serv_conn == "SFTP") {
+if (serv_conn == "SFTP") {
   user <- "mcoghill"
   serv <- paste0("//", user, "@aurorauav.synology.me/Cheatgrass")
-} else if(serv_conn == "Local") {
+} else if (serv_conn == "Local") {
   serv <- "//AuroraNAS/Cheatgrass"
-} else if(serv_conn == "Synology") {
+} else if (serv_conn == "Synology") {
   serv <- file.path(Sys.getenv("USERPROFILE"), "SynologyDrive/Cheatgrass")
-} else serv <- serv_conn
+} else {
+  serv <- serv_conn
+}
 
 # Provide path to KMZ file with flight areas. Extract to KML to be read is as sf
 kmz <- file.path(
-  serv, "KML Flight Areas/South Thompson Project Area/overall area/South Thompson Project Area - 2024.kmz")
+  serv, "KML Flight Areas/South Thompson Project Area/overall area/South Thompson Project Area - 2024.kmz"
+)
 unzip(kmz, exdir = dirname(kmz))
 file.rename(file.path(dirname(kmz), "doc.kml"), gsub(".kmz$", ".kml", kmz))
 
 # Read KML in as sf object
-flight_areas <- st_read(gsub(".kmz$", ".kml", kmz), quiet = TRUE) %>% 
-  st_zm() %>% 
-  st_transform(3153) %>% 
+flight_areas <- st_read(gsub(".kmz$", ".kml", kmz), quiet = TRUE) %>%
+  st_zm() %>%
+  st_transform(3153) %>%
   filter(Name != "South Thompson Project Area")
 
 # Create unioned geometry (SpatVector, used for masking the TRIM elevation later)
-full_area <- flight_areas %>% 
-  st_union() %>% 
-  vect() %>% 
+full_area <- flight_areas %>%
+  st_union() %>%
+  vect() %>%
   fillHoles()
 
 # Create unioned geometry (sf, for BC Data catalog)
 full_area_sf <- st_as_sf(full_area) %>% st_set_agr("constant")
 
 # Download the roads layer from the BC Data catalog
-roads <- bcdc_query_geodata("bb060417-b6e6-4548-b837-f9060d94743e", crs = 3153) %>% 
-  filter(INTERSECTS(full_area_sf)) %>% 
-  collect() %>% 
-  st_set_agr("constant") %>% 
-  st_intersection(full_area_sf) %>% 
-  st_geometry() %>% 
+roads <- bcdc_query_geodata("bb060417-b6e6-4548-b837-f9060d94743e", crs = 3153) %>%
+  filter(INTERSECTS(full_area_sf)) %>%
+  collect() %>%
+  st_set_agr("constant") %>%
+  st_intersection(full_area_sf) %>%
+  st_geometry() %>%
   st_as_sf() %>%
   mutate(road = 0)
 
-# Download TRIM elevation (this is all that is completely available for the 
-# entire study area as of August 2024). Reproject to BC Albers and mask to the 
+# Download TRIM elevation (this is all that is completely available for the
+# entire study area as of August 2024). Reproject to BC Albers and mask to the
 # shape of the study area.
-dem <- cded_terra(full_area_sf) %>% 
-  project(crs(full_area)) %>% 
+dem <- cded_terra(full_area_sf) %>%
+  project(crs(full_area)) %>%
   mask(full_area)
 
 ```
@@ -94,10 +100,11 @@ SAGA GIS is used to generate a few predictor layers, as well as an accumulated c
 
 # Produce some SAGA layers
 slope <- saga$ta_morphometry$slope_aspect_curvature(
-  elevation = dem, 
+  elevation = dem,
   slope = file.path(tempdir(), "slope_temp.tif"),
-  aspect = file.path(tempdir(), "aspect_temp.tif"), 
-  unit_slope = 1, unit_aspect = 1, .all_outputs = FALSE)
+  aspect = file.path(tempdir(), "aspect_temp.tif"),
+  unit_slope = 1, unit_aspect = 1, .all_outputs = FALSE
+)
 aspect <- slope$aspect
 slope <- slope$slope
 
@@ -105,42 +112,50 @@ slope <- slope$slope
 mrvbf_thresh <- mrvbf_threshold(res = res(dem)[1])
 mrvbf <- saga$ta_morphometry$
   multiresolution_index_of_valley_bottom_flatness_mrvbf(
-    dem = dem, 
-    mrvbf = file.path(tempdir(), "mrvbf.tif"), 
-    mrrtf = file.path(tempdir(), "mrrtf.tif"), t_slope = mrvbf_thresh)
+  dem = dem,
+  mrvbf = file.path(tempdir(), "mrvbf.tif"),
+  mrrtf = file.path(tempdir(), "mrrtf.tif"), t_slope = mrvbf_thresh
+)
 
 # Terrain ruggedness index
 tri <- saga$ta_morphometry$terrain_ruggedness_index_tri(
-  dem = dem, tri = file.path(tempdir(), "tri.tif"))
+  dem = dem, tri = file.path(tempdir(), "tri.tif")
+)
 
 # Strahler stream order, layer not needed for modelling
 so <- saga$ta_channels$strahler_order(
-  dem = dem, 
-  strahler = file.path(tempdir(), "strahler_TEMP.tif"), 
-  .all_outputs = FALSE)
+  dem = dem,
+  strahler = file.path(tempdir(), "strahler_TEMP.tif"),
+  .all_outputs = FALSE
+)
 
-# Channel network, layer not needed for modelling - default initiation value of 
+# Channel network, layer not needed for modelling - default initiation value of
 # 5 is based on this being a default value used in another tool
 cn <- saga$ta_channels$channel_network(
   elevation = dem, init_grid = so, init_value = 5,
-  chnlntwrk = file.path(tempdir(), "cn_TEMP.tif"), .all_outputs = FALSE)
+  chnlntwrk = file.path(tempdir(), "cn_TEMP.tif"), .all_outputs = FALSE
+)
 
 # Vertical distance to channel network
 v_dist_cn <- saga$ta_channels$vertical_distance_to_channel_network(
   elevation = dem, channels = cn,
-  distance = file.path(tempdir(), "vert_dist_cn.tif"), .all_outputs = FALSE)
+  distance = file.path(tempdir(), "vert_dist_cn.tif"), .all_outputs = FALSE
+)
 
 # Rasterize roads layer for SAGA GIS
 roads_rast <- rasterize(
-  vect(roads), dem, field = "road", 
-  filename = file.path(tempdir(), "roads.tif"), overwrite = TRUE)
+  vect(roads), dem,
+  field = "road",
+  filename = file.path(tempdir(), "roads.tif"), overwrite = TRUE
+)
 
 # Create accumulated cost layer
 cost <- saga$grid_analysis$accumulated_cost(
-  dest_type = 1, dest_grid = roads_rast, 
+  dest_type = 1, dest_grid = roads_rast,
   cost = slope, dir_maxcost = aspect,
   accumulated = file.path(tempdir(), "cost.tif"),
-  dir_unit = 1)
+  dir_unit = 1
+)
 
 # Get layers ready for CLHS
 inlyrs <- c(slope, mrvbf$mrvbf, tri, v_dist_cn, cost)
@@ -155,13 +170,13 @@ Finally, we bring the generated raster layers, cost layer, and roads layer toget
 
 # Sample away from roads and don't sample along edge of polygons by
 # applying a negative buffer on the polygons.
-roads_buf <- roads %>% 
-  st_buffer(25) %>% 
+roads_buf <- roads %>%
+  st_buffer(25) %>%
   st_union()
-sample_area <- flight_areas %>% 
-  st_buffer(-35) %>% 
-  st_set_agr("constant") %>% 
-  st_difference(roads_buf) %>% 
+sample_area <- flight_areas %>%
+  st_buffer(-35) %>%
+  st_set_agr("constant") %>%
+  st_difference(roads_buf) %>%
   st_set_agr("constant")
 
 # Do the CLHS for each polygon, generating 12 points per polygon.
@@ -170,19 +185,21 @@ set.seed(123)
 sample_pts <- do.call(rbind, lapply(1:nrow(sample_area), function(x) {
   inmask <- stack(crop(inlyrs, sample_area[x, ], mask = TRUE))
   clhs_sample <- clhs(inmask, size = 12, cost = "cost", simple = FALSE)$
-    sampled_data %>% 
+    sampled_data %>%
     st_as_sf()
-})) %>% 
-  st_transform(3153) %>% 
-  st_set_agr("constant") %>% 
-  st_intersection(sample_area) %>% 
-  select(Name) %>% 
-  group_by(Name) %>% 
-  mutate(Name = paste0("Block ", Name,"_P", 1:n()))
+})) %>%
+  st_transform(3153) %>%
+  st_set_agr("constant") %>%
+  st_intersection(sample_area) %>%
+  select(Name) %>%
+  group_by(Name) %>%
+  mutate(Name = paste0("Block ", Name, "_P", 1:n()))
 
 # Write the sample points out as a KML file for importing into Avenza maps
 st_write(sample_pts, file.path(
-  serv, "Vegetation Data - 2024/AuroraUAV_2024_SamplePts.kml"), 
-  quiet = TRUE, delete_dsn = TRUE)
+  serv, "Vegetation Data - 2024/AuroraUAV_2024_SamplePts.kml"
+),
+quiet = TRUE, delete_dsn = TRUE
+)
 
 ```
