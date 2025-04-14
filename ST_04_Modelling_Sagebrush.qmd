@@ -1,0 +1,918 @@
+---
+title: "ST_04_Modelling" 
+author: "Matthew Coghill" 
+format: html 
+editor: source 
+---
+
+# Sagebrush Modelling
+
+This script takes the data generated from the previous two scripts (predictor layer generation and variable extraction) and creates many models from that data. The best fit model is what is used to create the mapped predictions. Models are resampled using either spatial cross validation, or regular cross validation depending on the model type and if it was inner/outer resampling. Model metrics are generated and saved at the end of the script. Due to the large number of models generated, RAM usage spikes. After modelling, the extra models are removed from the system in order to prevent the R session from bogging down too much.
+
+First, load the required packages.
+
+```{r init, include=FALSE}
+
+ls <- c(
+  "tidyverse", "terra", "sf", "mlr3verse", "mlr3spatial", "ranger",
+  "mlr3spatiotempcv", "future", "vip"
+)
+invisible(suppressPackageStartupMessages(
+  lapply(ls, library, character.only = TRUE)
+))
+rm(ls)
+
+# Set file access either over SFTP connection, Local LAN, or through the
+# Synology Drive app (i.e.: "SFTP", "Local", "SynologyDrive", or whatever the
+# folder name is for your Synology Drive app location)
+serv_conn <- "D:/AuroraUAV/Cheatgrass"
+
+# Use at own risk:
+# options(parallelly.fork.enable = TRUE)
+
+# Reduce the text output from modelling
+lgr::get_logger("mlr3")$set_threshold("warn")
+lgr::get_logger("bbotk")$set_threshold("warn")
+
+```
+
+## Load field data, points, and air photo points
+
+Next, we will initialize the folders and files used during modelling. Data wrangling is performed on the cover data to create a new dataset of "cover classes". This allots us with a total of 3 models: a probability of presence model (binary classification), a cover model showing raw cover values (regression), and a cover class model (classification).
+
+```{r load_data, include=FALSE}
+
+# Determine server directory method (change username if using SFTP connection)
+if (serv_conn == "SFTP") {
+  user <- "mcoghill"
+  serv <- paste0("//", user, "@aurorauav.synology.me/Cheatgrass")
+} else if (serv_conn == "Local") {
+  serv <- "//AuroraNAS/Cheatgrass"
+} else if (serv_conn == "Synology") {
+  serv <- file.path(Sys.getenv("USERPROFILE"), "SynologyDrive/Cheatgrass")
+} else {
+  serv <- serv_conn
+}
+
+# Get the field data files (note: looking to move this to a different folder
+# at a later date, so change this as needed):
+proj <- "South Thompson"
+
+# Define output directory
+out_dir <- file.path(serv, "Modelling/Outputs", proj)
+dir.create(out_dir, showWarnings = FALSE)
+
+# Load field data
+fd_p <- file.path(serv, "Modelling/Field Data", proj, paste0(
+  proj, "sagebrush_modelling_data.gpkg"
+))
+sage_pres <- st_read(fd_p, "presence", quiet = TRUE) %>%
+  filter(!is.na(presence)) %>%
+  mutate(presence = factor(presence, levels = c("TRUE", "FALSE")))
+sage_cover <- st_read(fd_p, "cover", quiet = TRUE)
+cc_ids <- c(
+  "Free (0%)", "Trace (1-5%)", "Light Infestation (5-25%)",
+  "Mild Infestation (25-50%)", "Sagebrush Dominated (50-100%)"
+)
+sage_cc <- sage_cover %>%
+  mutate(cover_class = factor(case_when(
+    between(cover, -Inf, 0) ~ cc_ids[1],
+    between(cover, 0, 5) ~ cc_ids[2],
+    between(cover, 5, 25) ~ cc_ids[3],
+    between(cover, 25, 50) ~ cc_ids[4],
+    between(cover, 50, Inf) ~ cc_ids[5]
+  ), levels = cc_ids), .after = cover) %>%
+  select(-cover)
+
+# Load raster data
+layr_dir <- file.path(serv, "Modelling/Layers", proj)
+cov_layrs <- list.files(layr_dir, pattern = ".tif$", full.names = TRUE)
+cov_layrs <- cov_layrs[grep(
+  paste(names(sage_pres), collapse = ".tif|"),
+  basename(cov_layrs)
+)]
+covs <- rast(cov_layrs)
+
+```
+
+## Presence, spatial CV
+
+We begin modelling with the main probability model showing how likely it is that cheatgrass is present in an area. This is the best model that can be produced with the given data as we are able to make use of both field data and air-photo calls to generate the map. First, we create a bunch of models from a leave-one-out cross validation resampling that we use to evaluate variable importance with. The variable importance values are summed across each of the model runs, and those summed values will replace the variable importance values for the "best model" found from that resampling run (i.e.: it doesn't matter really what the results of this best model was since we only need to use it for it's importance values). With aggregated variable importance found, we can pipe that in to our modelling pipeline as a "feature filtering" step which is combined with hyperparameter tuning at the same stage instead of wrapped in its own auto feature selection step. This was crucial as it vastly improved the modelling speed (don't need to have a 3rd layer of recursion which needs to be resampled) and modelling results (more data can be used to generate models with). With the filtered learner pipeline in place, it gets used as the learner for the autotuner which tunes the num.trees and mtry values of the random forest model. This is the "inner" resampling stage; the best results of the inner resampling stage inform the outer resampling what the best parameters should be set to. Using all of the data that was in the inner resampling as training data, it builds a model and then tests it with the outer test data which has never been used for modelling. This gets repeated until all of the data has been used as testing data exactly once. The best model results are extracted as well as the model in order to create the map prediction.
+
+```{r probability_modelling, include=FALSE}
+
+tsk_pres <- as_task_classif_st(
+  sage_pres,
+  target = "presence", positive = "TRUE"
+)
+tsk_pres$set_col_roles("block", remove_from = "feature")
+tsk_pres$set_col_roles("presence", roles = c("target", "stratum"))
+
+# Create the learner for feature filtering
+lrn_filter <- lrn(
+  "classif.ranger",
+  importance = "impurity", predict_type = "prob"
+)
+
+# Train a ranger learner which will have stored feature importances. This order
+# of features is what will be used downstream for feature filtering.
+plan(multisession, workers = availableCores() %/% 4)
+rr_filter <- resample(tsk_pres, lrn_filter, rsmp("loo"), store_models = TRUE)
+plan(sequential)
+
+# spoof (aggregate) the importance values
+rr_learners <- rr_filter$learners
+rr_imps <- as.data.frame(
+  sapply(rr_learners, function(x) x$importance())
+)
+rr_imps_vals <- sort(rowSums(rr_imps), decreasing = TRUE)
+rr_filter_results <- as.data.table(rr_filter$score(msr("oob_error")))
+best_filter_id <- which.min(rr_filter_results$oob_error)
+filter_learner <- rr_filter$learners[[best_filter_id]]$base_learner()
+filter_learner$model$variable.importance <- rr_imps_vals
+
+# Place the best resulting learner into a filtering pipeop
+po_filter <- po("filter",
+  filter = flt("importance", learner = filter_learner),
+  filter.nfeat = to_tune(1, length(tsk_pres$feature_names))
+)
+
+# Next, create a learner pipeop that will tune the hyperparameters
+lrn_tune <- lrn("classif.ranger",
+  importance = "impurity",
+  predict_type = "prob",
+  num.trees = to_tune(100, 2000),
+  mtry = to_tune(1, length(tsk_pres$feature_names))
+)
+po_lrn <- po("learner", lrn_tune)
+
+# Create the graph learner object that will combine these
+graph <- as_learner(po_filter %>>% po_lrn)
+
+# Create the tuning design grid to tune across possible nfeat and mtry values
+design <- expand.grid(
+  importance.filter.nfeat = length(tsk_pres$feature_names):4,
+  classif.ranger.num.trees = c(500, 1000, 2000),
+  classif.ranger.mtry = length(tsk_pres$feature_names):1
+) %>%
+  dplyr::filter(classif.ranger.mtry <= importance.filter.nfeat)
+tn <- tnr("design_points", design = as.data.table(design))
+
+# Create the auto-tuner object
+at <- auto_tuner(
+  tuner = tn,
+  learner = graph,
+  resampling = rsmp("cv", folds = 6),
+  measure = msr("classif.bbrier"),
+  terminator = trm("none")
+)
+
+# Runs both outer and inner loops in parallel
+plan(list(
+  tweak(multisession, workers = availableCores() %/% 3),
+  tweak(multisession, workers = I(3))
+))
+rr <- mlr3::resample(
+  tsk_pres, at, rsmp("spcv_coords", folds = 10),
+  store_models = TRUE
+)
+plan(sequential)
+
+# Get the best model for prediction: first, get all outer learners. These would
+# have the most data used for training and testing and will produce the most
+# reliable results
+data <- as.data.table(rr)
+outer_learners <- lapply(data$learner, "[[", "learner")
+
+# From the same object, extract the table of tuning results which can be viewed
+# and queried
+outer_results <- as.data.table(rr$score(msr("classif.bbrier")))
+
+# Now, from the outer learners, extract the one with the lowest binary Brier
+# score. Note that if the data is imbalanced, we should probably evaluate
+# models using the area under the precision recall ROC curve (classif.prauc)
+# according to the documentation
+best_id <- which.min(outer_results$classif.bbrier)
+best_learner <- outer_learners[[best_id]]$base_learner()
+
+# Get aggregated results:
+best_agg_score <- rr$aggregate(msr("classif.bbrier"))
+ml_prediction <- as.data.table(rr$prediction())
+ml_confusion <- rr$prediction()$confusion
+bin_msrs <- mlr3measures::confusion_matrix(ml_prediction$truth, ml_prediction$response, positive = "TRUE")
+
+# Extract the actual ranger model from the mlr3 modelling. Use a custom predict
+# function to extract the "TRUE" probability results only. Also, define the
+# filename of the output TIF file as well as only the covariates involved in
+# the eventual model. The mlr3spatial package has a handy hidden function
+# "block_size()" which we will use to define the number of blocks (tiles) that
+# the prediction must take place in. The "chunksize" parameter is the size in MB
+# that a chunk should be. Larger values of this will result in fewer tiles, but
+# more RAM usage, so alter this to meet the requirements of your system.
+ranger_model <- best_learner$model
+fun <- function(model, ...) predict(model, ...)$predictions[, "TRUE"]
+prob_path <- file.path(out_dir, paste0(proj, "_sagebrush_probability_model.tif"))
+prob_covs <- covs[[names(ranger_model$variable.importance)]]
+bs <- mlr3spatial:::block_size(prob_covs, chunksize = 1500)
+
+# Clear memory
+rm(
+  lrn_filter, rr_filter, rr_learners, rr_imps, rr_imps_vals, rr_filter_results,
+  best_filter_id, filter_learner, po_filter, lrn_tune, po_lrn, graph, tn, at, rr,
+  data, outer_learners, outer_results, best_id, best_learner
+)
+gc()
+
+# Predict model
+prob_predict <- terra::predict(
+  prob_covs, ranger_model,
+  fun = fun, na.rm = TRUE,
+  filename = prob_path, overwrite = TRUE, wopt = list(
+    steps = length(bs[[1]]),
+    names = paste0(proj, "_sagebrush_probability_model")
+  )
+)
+
+# Reclassify into probability categories
+rcl <- matrix(c(
+  -Inf, 0.10, 1,
+  0.10, 0.40, 2,
+  0.40, 0.60, 3,
+  0.60, 0.90, 4,
+  0.90, Inf, 5
+), ncol = 3, byrow = TRUE)
+cls <- data.frame(
+  id = 1:5,
+  class = c(
+    "Very unlikely to occur (0-10%)",
+    "Unlikely to occur (11-40%)",
+    "May occur about half of the time (41-60%)",
+    "Likely to occur (61-90%)", "Very likely to occur (91-100%)"
+  ),
+  col = c("green", "deepskyblue", "yellow", "orange", "red")
+)
+prob_classes <- classify(prob_predict, rcl)
+
+# Provide factor classes and associated colours for each level. Write to .tif file
+levels(prob_classes) <- cls[, 1:2]
+coltab(prob_classes) <- cls[, c(1, 3)]
+prob_classes <- writeRaster(prob_classes, file.path(
+  out_dir, paste0(proj, "_sagebrush_probability_model_classified.tif")
+),
+overwrite = TRUE, datatype = "INT1U"
+)
+
+# Write the model, input data, and machine learned confusion matrix
+saveRDS(ranger_model, file.path(
+  out_dir, paste0(proj, "_sagebrush_probability_model.rds")
+))
+write.csv(cbind(tsk_pres$data(), tsk_pres$coordinates()), file.path(
+  out_dir, paste0(proj, "_sagebrush_probability_model_data.csv")
+),
+row.names = FALSE
+)
+write.ftable(ftable(ml_confusion), file.path(
+  out_dir, paste0(proj, "_sagebrush_probability_confusion_matrix.csv")
+),
+quote = FALSE, sep = ","
+)
+
+```
+
+## Cover, spatial CV
+
+The next model that is run is a cover based model. This uses the raw values of cover from the field data, as well as the "FALSE" air photo calls that have been translated as 0's. Unfortunately with the air photo interpretations, we cannot translate the "TRUE" air photo calls to a number, so those calls do not get used here. Using the data that we have access to, we can train a cheatgrass cover model using a random forest regression model. We begin similarly by finding a rough idea about the variable importance before feeding that information into the final model of cover. The predicted map of cover gets classified at the end to produce a "cover class" map. This is not to be confused with modelling cover classes, which is an entirely different process addressed down below.
+
+```{r cover_modelling, include=FALSE}
+
+tsk_cover <- as_task_regr_st(sage_cover, target = "cover")
+tsk_cover$set_col_roles("block", remove_from = "feature")
+
+# Create the learner for feature filtering
+cover_lrn_filter <- lrn("regr.ranger",
+  importance = "impurity",
+  predict_type = "response"
+)
+
+plan(multisession, workers = availableCores() %/% 4)
+cover_rr_filter <- resample(
+  tsk_cover, cover_lrn_filter, rsmp("loo"),
+  store_models = TRUE
+)
+plan(sequential)
+
+# spoof (aggregate) the importance values
+cover_rr_learners <- cover_rr_filter$learners
+cover_rr_imps <- as.data.frame(
+  sapply(cover_rr_learners, function(x) x$importance())
+)
+cover_rr_imps_vals <- sort(rowSums(cover_rr_imps), decreasing = TRUE)
+cover_rr_filter_results <- as.data.table(cover_rr_filter$score(msr("oob_error")))
+cover_best_filter_id <- which.min(cover_rr_filter_results$oob_error)
+cover_filter_learner <- cover_rr_filter$learners[[cover_best_filter_id]]$base_learner()
+cover_filter_learner$model$variable.importance <- cover_rr_imps_vals
+
+# Place the best resulting learner into a filtering pipeop
+cover_po_filter <- po(
+  "filter",
+  filter = flt("importance", learner = cover_filter_learner),
+  filter.nfeat = to_tune(1, length(tsk_cover$feature_names))
+)
+
+# Next, create a learner pipeop that will tune the hyperparameters
+cover_lrn_tune <- lrn("regr.ranger",
+  importance = "impurity",
+  predict_type = "response",
+  num.trees = to_tune(100, 2000),
+  mtry = to_tune(1, length(tsk_cover$feature_names))
+)
+cover_po_lrn <- po("learner", cover_lrn_tune)
+
+# Create the graph learner object that will combine these
+cover_graph <- as_learner(cover_po_filter %>>% cover_po_lrn)
+
+# Create the tuning design grid to tune across possible nfeat and mtry values
+cover_design <- expand.grid(
+  importance.filter.nfeat = (length(tsk_cover$feature_names)):4,
+  regr.ranger.num.trees = c(500, 1000, 2000),
+  regr.ranger.mtry = length(tsk_cover$feature_names):1
+) %>%
+  dplyr::filter(regr.ranger.mtry <= importance.filter.nfeat)
+cover_tn <- tnr("design_points", design = as.data.table(cover_design))
+
+# Create the auto-tuner object
+cover_at <- auto_tuner(
+  tuner = cover_tn,
+  learner = cover_graph,
+  resampling = rsmp("cv", folds = 5),
+  measure = msr("regr.rmse"),
+  terminator = trm("none")
+)
+
+# Runs both outer and inner loops in parallel
+plan(list(
+  tweak(multisession, workers = availableCores() %/% 4),
+  tweak(multisession, workers = I(4))
+))
+cover_rr <- mlr3::resample(
+  tsk_cover, cover_at, rsmp("spcv_coords", folds = 8),
+  store_models = TRUE
+)
+plan(sequential)
+
+# Get the best model for prediction: first, get all outer learners. These would
+# have the most data used for training and testing and will produce the most
+# reliable results
+cover_data <- as.data.table(cover_rr)
+cover_outer_learners <- lapply(cover_data$learner, "[[", "learner")
+
+# From the same object, extract the table of tuning results which can be viewed
+# and queried
+cover_outer_results <- as.data.table(cover_rr$score(msr("regr.rmse")))
+
+# Now, from the outer learners, extract the one with the lowest root mean squared
+# error score as this will represent actual percent cover differences in predicted
+# vs. actual data
+cover_best_id <- which.min(cover_outer_results$regr.rmse)
+cover_best_learner <- cover_outer_learners[[cover_best_id]]$base_learner()
+
+# Get some model results:
+cover_best_agg_score <- cover_rr$aggregate(msr("regr.rmse"))
+cover_ml_prediction <- as.data.table(cover_rr$prediction())
+
+# Extract model and set parameters
+cover_ranger_model <- cover_best_learner$model
+cover_fun <- function(model, ...) predict(model, ...)$predictions
+cover_path <- file.path(out_dir, paste0(proj, "_sagebrush_cover.tif"))
+cover_covs <- covs[[names(cover_ranger_model$variable.importance)]]
+cover_bs <- mlr3spatial:::block_size(cover_covs, chunksize = 1500)
+
+# Clear memory
+rm(
+  cover_lrn_filter, cover_rr_filter, cover_rr_learners, cover_rr_imps,
+  cover_rr_imps_vals, cover_rr_filter_results, cover_best_filter_id,
+  cover_filter_learner, cover_po_filter, cover_lrn_tune, cover_po_lrn,
+  cover_graph, cover_tn, cover_at, cover_rr, cover_data, cover_outer_learners,
+  cover_best_id, cover_best_learner, cover_outer_results
+)
+gc()
+
+# Predict model, same way as with probability modelling
+cover_predict <- terra::predict(
+  cover_covs, cover_ranger_model,
+  fun = cover_fun, na.rm = TRUE,
+  filename = cover_path, overwrite = TRUE, wopt = list(
+    steps = length(cover_bs[[1]]),
+    names = paste0(proj, "_sagebrush_cover_model")
+  )
+)
+
+# Reclassify into cover classes based on existing cover model
+cover_rcl <- matrix(c(
+  -Inf, 1, 1,
+  1, 5, 2,
+  5, 25, 3,
+  25, 50, 4,
+  50, Inf, 5
+), ncol = 3, byrow = TRUE)
+cover_cls <- data.frame(
+  id = 1:5,
+  class = c(
+    "Free (0%)", "Trace (1-5%)", "Light Infestation (5-25%)",
+    "Mild Infestation (25-50%)", "Sagebrush Dominated (50-100%)"
+  ),
+  col = c("green", "deepskyblue", "yellow", "orange", "red")
+)
+cover_classes <- classify(cover_predict, cover_rcl)
+
+# Provide factor classes and associated colours for each level. Write to .tif file
+levels(cover_classes) <- cover_cls[, 1:2]
+coltab(cover_classes) <- cover_cls[, c(1, 3)]
+cover_classes <- writeRaster(cover_classes, file.path(
+  out_dir, paste0(proj, "_sagebrush_cover_model_classified.tif")
+),
+overwrite = TRUE, datatype = "INT1U"
+)
+
+# Write the model and input data
+saveRDS(cover_ranger_model, file.path(
+  out_dir, paste0(proj, "_sagebrush_cover_model.rds")
+))
+write.csv(cbind(tsk_cover$data(), tsk_cover$coordinates()), file.path(
+  out_dir, paste0(proj, "_sagebrush_cover_model_data.csv")
+),
+row.names = FALSE
+)
+
+```
+
+## Balanced cover classes, non-spatial CV
+
+An inherent issue with our data is that we have a wild class imbalance (i.e.: lots of "Free (0%) calls but few other calls). One way to overcome this issue is to undersample majority classes as well as oversample underrepresented classes. Doing so will balance the data; however, we lose the ability to perform spatial cross validation in this manner. There might be a way to incorporate spatial cross validation back into the dataset by providing block ID's and then using block cross validation instead of regular cross validation, however I ran out of time before being able to attempt to figure that out.
+
+The script begins with class balancing using the "SMOTE" algorithm to get roughly similar numbers for sampled data. Then, it proceeds pretty similarly to the steps involved with the presence and cover models: first, find the variable importances of each variable in a small model, and use that information to provide the order of variables used in determining the number of variables to use in the model.
+
+```{r bal_cc_modelling, include=FALSE}
+
+tsk_bal_cc <- as_task_classif(
+  st_drop_geometry(sage_cc),
+  target = "cover_class", id = "bal_cc_aspatial"
+)
+tsk_bal_cc$set_col_roles("block", remove_from = "feature")
+
+# SMOTE can only work on numeric data columns, not integer. First, pipe the
+# integer to numeric function across the data, then SMOTE a few times to get
+# the proper balancing, then do class balancing, then convert data back to
+# integer type for the columns that require that.
+# For SMOTE, change dup_size to be the multiple that would reach roughly
+# the number of observations of the most popular class.
+table(sage_cc$cover_class)
+int_cols <- tsk_bal_cc$feature_types[type == "integer"]$id
+gr_smote <-
+  po("colapply",
+    id = "int_to_num",
+    applicator = as.numeric, affect_columns = selector_name(int_cols)
+  ) %>>%
+  po("smote", id = "smote1", dup_size = 30) %>>%
+  po("smote", id = "smote2", dup_size = 19) %>>%
+  po("smote", id = "smote3", dup_size = 3) %>>%
+  po("smote", id = "smote4", dup_size = 2) %>>%
+  po("classbalancing",
+    id = "classbalance", ratio = 0.3, reference = "major",
+    adjust = "major", shuffle = TRUE
+  ) %>>%
+  # po("imputeoor") %>>% # Maybe include this, or maybe filter NA's at end?
+  po("colapply",
+    id = "num_to_int",
+    applicator = function(x) as.integer(round(x, 0L)),
+    affect_columns = selector_name(int_cols)
+  )
+
+tsk_bal_cc <- gr_smote$train(tsk_bal_cc)[[1L]]
+tsk_bal_cc <- as_task_classif(
+  tsk_bal_cc$data()[complete.cases(tsk_bal_cc$data())],
+  target = "cover_class"
+)
+table(tsk_bal_cc$data(cols = "cover_class"))
+
+# Create the learner for feature filtering
+bal_cc_lrn_filter <- lrn("classif.ranger",
+  importance = "impurity",
+  predict_type = "response"
+)
+
+plan(multisession, workers = availableCores() %/% 4)
+bal_cc_rr_filter <- resample(tsk_bal_cc, bal_cc_lrn_filter, rsmp("loo"),
+  store_models = TRUE
+)
+plan(sequential)
+
+# spoof (aggregate) the importance values
+bal_cc_rr_learners <- bal_cc_rr_filter$learners
+bal_cc_rr_imps <- as.data.frame(
+  sapply(bal_cc_rr_learners, function(x) x$importance())
+)
+bal_cc_rr_imps_vals <- sort(rowSums(bal_cc_rr_imps), decreasing = TRUE)
+bal_cc_rr_filter_results <- as.data.table(
+  bal_cc_rr_filter$score(msr("oob_error"))
+)
+bal_cc_best_filter_id <- which.min(bal_cc_rr_filter_results$oob_error)
+bal_cc_filter_learner <- bal_cc_rr_filter$learners[[bal_cc_best_filter_id]]$base_learner()
+bal_cc_filter_learner$model$variable.importance <- bal_cc_rr_imps_vals
+
+# Place the best resulting learner into a filtering pipeop
+bal_cc_po_filter <- po(
+  "filter",
+  filter = flt("importance", learner = bal_cc_filter_learner),
+  filter.nfeat = to_tune(1, length(tsk_bal_cc$feature_names))
+)
+
+# Next, create a learner pipeop that will tune the hyperparameters
+bal_cc_lrn_tune <- lrn("classif.ranger",
+  importance = "impurity",
+  predict_type = "response",
+  num.trees = to_tune(100, 2000),
+  mtry = to_tune(1, length(tsk_bal_cc$feature_names))
+)
+bal_cc_po_lrn <- po("learner", bal_cc_lrn_tune)
+
+# Create the graph learner object that will combine these
+bal_cc_graph <- as_learner(bal_cc_po_filter %>>% bal_cc_po_lrn)
+
+# Create the tuning design grid to tune across possible nfeat and mtry values
+bal_cc_design <- expand.grid(
+  importance.filter.nfeat = length(tsk_bal_cc$feature_names):4,
+  classif.ranger.num.trees = c(500, 1000, 2000),
+  classif.ranger.mtry = length(tsk_bal_cc$feature_names):1
+) %>%
+  dplyr::filter(classif.ranger.mtry <= importance.filter.nfeat)
+bal_cc_tn <- tnr("design_points", design = as.data.table(bal_cc_design))
+
+# Create the auto-tuner object and give it a uniuqe ID
+bal_cc_at <- auto_tuner(
+  tuner = bal_cc_tn,
+  learner = bal_cc_graph,
+  resampling = rsmp("cv", folds = 5),
+  measure = msr("classif.acc"),
+  terminator = trm("none")
+)
+bal_cc_at$id <- "bal_cc_tuner"
+
+# Write the SMOTE'd dataset to a file
+write.csv(tsk_bal_cc$data(), file.path(
+  out_dir, paste0(proj, "_cover_class_model_data_SMOTE.csv")
+),
+row.names = FALSE
+)
+
+```
+
+## Cover Classes, spatial CV
+
+We also build a cover class model using spatial cross validation, but it lacks the SMOTE usage here so classes are left imbalanced.
+
+```{r unbal_cc_modelling, include=FALSE}
+
+tsk_unbal_cc <- as_task_classif_st(
+  sage_cc,
+  target = "cover_class", id = "unbal_cc_spatial"
+)
+tsk_unbal_cc$set_col_roles("block", remove_from = "feature")
+
+# Create the learner for feature filtering
+unbal_cc_lrn_filter <- lrn("classif.ranger",
+  importance = "impurity",
+  predict_type = "response"
+)
+
+plan(multisession, workers = availableCores() %/% 4)
+unbal_cc_rr_filter <- resample(
+  tsk_unbal_cc, unbal_cc_lrn_filter, rsmp("loo"),
+  store_models = TRUE
+)
+plan(sequential)
+
+# spoof (aggregate) the importance values
+unbal_cc_rr_learners <- unbal_cc_rr_filter$learners
+unbal_cc_rr_imps <- as.data.frame(
+  sapply(unbal_cc_rr_learners, function(x) x$importance())
+)
+unbal_cc_rr_imps_vals <- sort(rowSums(unbal_cc_rr_imps), decreasing = TRUE)
+unbal_cc_rr_filter_results <- as.data.table(
+  unbal_cc_rr_filter$score(msr("oob_error"))
+)
+unbal_cc_best_filter_id <- which.min(unbal_cc_rr_filter_results$oob_error)
+unbal_cc_filter_learner <- unbal_cc_rr_filter$learners[[unbal_cc_best_filter_id]]$base_learner()
+unbal_cc_filter_learner$model$variable.importance <- unbal_cc_rr_imps_vals
+
+# Place the best resulting learner into a filtering pipeop
+unbal_cc_po_filter <- po(
+  "filter",
+  filter = flt("importance", learner = unbal_cc_filter_learner),
+  filter.nfeat = to_tune(1, length(tsk_unbal_cc$feature_names))
+)
+
+# Next, create a learner pipeop that will tune the hyperparameters
+unbal_cc_lrn_tune <- lrn("classif.ranger",
+  importance = "impurity",
+  predict_type = "response",
+  num.trees = to_tune(100, 2000),
+  mtry = to_tune(1, length(tsk_unbal_cc$feature_names))
+)
+
+unbal_cc_po_lrn <- po("learner", unbal_cc_lrn_tune)
+
+# Create the graph learner object that will combine these
+unbal_cc_graph <- as_learner(unbal_cc_po_filter %>>% unbal_cc_po_lrn)
+
+# Create the tuning design grid to tune across possible nfeat and mtry values
+unbal_cc_design <- expand.grid(
+  importance.filter.nfeat = length(tsk_unbal_cc$feature_names):4,
+  classif.ranger.num.trees = c(500, 1000, 2000),
+  classif.ranger.mtry = length(tsk_unbal_cc$feature_names):1
+) %>%
+  dplyr::filter(classif.ranger.mtry <= importance.filter.nfeat)
+unbal_cc_tn <- tnr("design_points", design = as.data.table(unbal_cc_design))
+
+# Create the auto-tuner object and give it a uniuqe ID
+unbal_cc_at <- auto_tuner(
+  tuner = unbal_cc_tn,
+  learner = unbal_cc_graph,
+  resampling = rsmp("cv", folds = 5),
+  measure = msr("classif.bacc"),
+  terminator = trm("none")
+)
+unbal_cc_at$id <- "unbal_cc_tuner"
+
+# Write the input dataset
+write.csv(cbind(tsk_unbal_cc$data(), tsk_unbal_cc$coordinates()), file.path(
+  out_dir, paste0(proj, "_cover_class_model_data.csv")
+),
+row.names = FALSE
+)
+
+```
+
+### Benchmark cover class models
+
+True benchmarking doesn't work because of differing task types, but I can essentially create my own benchmark here where I look at the results and make a decision based on model scoring for which cover class model will be produced. Notes:
+
+-   classif.acc is used for balanced datasets while classif.bacc is used for unbalanced datasets
+
+-   Class balancing is sure to have a positive model impact, though the map might not be as true to life as expected
+
+-   A fair comparison would be between the class balanced dataset (non-spatial) and an imbalanced dataset that is also non-spatial; however, this takes time to produce and is not expected to outperform the balanced dataset.
+
+A best model is chosen manually from looking at the combined aggregated model accuracy score, individual best model accuracy score from the outer cross validation, and the internal model's OOB error score. This is the chosen model for map predictions for cover class modelling.
+
+```{r cc_bench, include=FALSE}
+
+# Runs both outer and inner loops in parallel
+plan(list(
+  tweak(multisession, workers = availableCores() %/% 4),
+  tweak(multisession, workers = I(4))
+))
+
+# Can't evaluate each of these in a benchmark because of differing task types,
+# so must evaluate manually
+bal_cc_rr <- resample(tsk_bal_cc, bal_cc_at, rsmp("cv", folds = 8),
+  store_models = TRUE
+)
+unbal_cc_rr <- resample(tsk_unbal_cc, unbal_cc_at, rsmp("spcv_coords", folds = 8),
+  store_models = TRUE
+)
+# unbal_cc_rr_ng <- resample(tsk_unbal_cc, unbal_cc_at, rsmp("cv", folds = 8),
+#                            store_models = TRUE)
+plan(sequential)
+
+# List all of the resample results together
+cc_rr_list <- list(bal_cc_rr, unbal_cc_rr)
+cc_results <- as.data.frame(sapply(cc_rr_list, function(x) {
+  cc_data <- as.data.table(x)
+  cc_outer_learners <- lapply(cc_data$learner, "[[", "learner")
+
+  # From the same object, extract the table of tuning results which can be
+  # viewed and queried. Use "classif.acc" for the balanced data, and
+  # "classif.bacc" for the unbalanced data
+  msr <- ifelse(x$task_type == "classif", "classif.acc", "classif.bacc")
+  cc_outer_results <- as.data.table(x$score(msr(msr)))
+
+  # Now, from the outer learners, extract the one with the highest (balanced)
+  # accuracy score.
+  cc_best_id <- which.max(cc_outer_results[[msr]])
+  cc_best_learner <- cc_outer_learners[[cc_best_id]]$base_learner()
+
+  # Get some model results:
+  cc_best_agg_score <- x$aggregate(msr(msr))
+  mod_oob <- cc_best_learner$model$prediction.error
+  return(list(
+    aggregated_score = cc_best_agg_score,
+    outer_fold_msr = max(cc_outer_results[[msr]]),
+    model_oob = mod_oob
+  ))
+}))
+
+# Use some math to "roughly estimate" model performance across aggregated,
+# individual, and model specific scores
+cc_results_an <- (unlist(cc_results[1, ]) + unlist(cc_results[2, ]) -
+  unlist(cc_results[3, ])) %>% unname()
+
+# Best results seem to be with the balanced dataset, so choose that moving forward
+cc_rr <- cc_rr_list[[which.max(cc_results_an)]]$clone()
+msr <- ifelse(cc_rr$task_type == "classif", "classif.acc", "classif.bacc")
+cc_outer_results <- as.data.table(cc_rr$score(msr(msr)))
+
+# Now, from the outer learners, extract the one with the highest (balanced)
+# accuracy score.
+cc_best_id <- which.min(cc_outer_results[[msr]])
+cc_outer_learners <- cc_outer_results$learner
+cc_best_learner <- cc_outer_learners[[cc_best_id]]$base_learner()
+
+# Get some model results:
+cc_best_agg_score <- cc_rr$aggregate(msr(msr))
+cc_ml_prediction <- as.data.table(cc_rr$prediction())
+cc_ml_confusion <- cc_rr$prediction()$confusion
+
+# Extract model and set parameters
+cc_path <- file.path(out_dir, paste0(proj, "_sagebrush_cover_class_model.tif"))
+cc_ranger_model <- cc_best_learner$model
+cc_fun <- function(model, ...) predict(model, ...)$predictions
+cc_covs <- covs[[names(cc_ranger_model$variable.importance)]]
+cc_bs <- mlr3spatial:::block_size(cc_covs, chunksize = 1500)
+
+# Clear memory
+rm(
+  gr_smote, bal_cc_lrn_filter, bal_cc_rr_filter, bal_cc_rr_learners,
+  bal_cc_rr_imps, bal_cc_rr_imps_vals, bal_cc_rr_filter_results,
+  bal_cc_best_filter_id, bal_cc_filter_learner, bal_cc_po_filter,
+  bal_cc_lrn_tune, bal_cc_po_lrn, bal_cc_graph, bal_cc_tn, bal_cc_at,
+  unbal_cc_lrn_filter, unbal_cc_rr_filter, unbal_cc_rr_learners,
+  unbal_cc_rr_imps, unbal_cc_rr_imps_vals, unbal_cc_rr_filter_results,
+  unbal_cc_best_filter_id, unbal_cc_filter_learner, unbal_cc_po_filter,
+  unbal_cc_lrn_tune, unbal_cc_po_lrn, unbal_cc_graph, unbal_cc_design,
+  unbal_cc_at, bal_cc_rr, unbal_cc_rr, unbal_cc_rr_ng, cc_rr_list, cc_results,
+  cc_results_an, cc_rr, cc_outer_results, cc_best_id, cc_outer_learners,
+  cc_best_learner
+)
+gc()
+
+# Predict model, specifying datatype to be INT1U. Write to a temporary file
+# as we still need a color table to be written to it.
+cc_predict <- terra::predict(
+  cc_covs, cc_ranger_model,
+  fun = cc_fun, na.rm = TRUE,
+  filename = file.path(tempdir(), basename(cc_path)),
+  overwrite = TRUE, wopt = list(
+    steps = length(cc_bs[[1]]),
+    names = paste0(proj, "_sagebrush_cover_class_model"),
+    datatype = "INT1U"
+  )
+)
+
+# Provide factor classes and associated colours for each level. Write to .tif file
+cls <- data.frame(
+  id = 1:5,
+  class = c(
+    "Free (0%)", "Trace (1-5%)", "Light Infestation (5-25%)",
+    "Mild Infestation (25-50%)", "Bheatgrass Dominated (50-100%)"
+  ),
+  col = c("green", "deepskyblue", "yellow", "orange", "red")
+)
+coltab(cc_predict) <- cls[, c(1, 3)]
+cc_predict <- writeRaster(
+  cc_predict, cc_path,
+  overwrite = TRUE, datatype = "INT1U"
+)
+
+# Save model and confusion matrix. Delete temporary file
+saveRDS(cc_ranger_model, file.path(
+  out_dir, paste0(proj, "_sagebrush_cover_class_model.rds")
+))
+write.ftable(ftable(cc_ml_confusion), file.path(
+  out_dir, paste0(proj, "_sagebrush_cover_class_confusion_matrix.csv")
+),
+quote = FALSE, sep = ","
+)
+unlink(file.path(tempdir(), basename(cc_path)))
+
+```
+
+## Modelling results
+
+Now, place all modelling results into easily readable CSV files and images. This includes variable importance metrics and images, tuning results (best nfeat, num.trees, and mtry values), machine learning metrics (aggregated scores), and model specific metrics.
+
+```{r mod_results, include=FALSE}
+
+# Variable importance data
+prob_varimp <- cbind(
+  data.frame(
+    model = "probability"
+  ),
+  t(data.frame(sort(ranger_model$variable.importance, decreasing = TRUE)))
+)
+prob_varimp[nrow(prob_varimp) + 1, ] <- ""
+cover_varimp <- cbind(
+  data.frame(
+    model = "cover"
+  ),
+  t(data.frame(sort(cover_ranger_model$variable.importance, decreasing = TRUE)))
+)
+cover_varimp[nrow(cover_varimp) + 1, ] <- ""
+cc_varimp <- cbind(
+  data.frame(
+    model = "cover class"
+  ),
+  t(data.frame(sort(cc_ranger_model$variable.importance, decreasing = TRUE)))
+)
+cc_varimp[nrow(cc_varimp) + 1, ] <- ""
+write.table(prob_varimp, file.path(
+  out_dir, paste0(proj, "_model_importance.csv")
+),
+row.names = FALSE, append = TRUE, sep = ","
+)
+write.table(cover_varimp, file.path(
+  out_dir, paste0(proj, "_model_importance.csv")
+),
+row.names = FALSE, append = TRUE, sep = ","
+)
+write.table(cc_varimp, file.path(
+  out_dir, paste0(proj, "_model_importance.csv")
+),
+row.names = FALSE, append = TRUE, sep = ","
+)
+
+# Variable importance figures
+prob_varimp_fig <- vip(ranger_model, num_features = length(prob_varimp))
+cover_varimp_fig <- vip(cover_ranger_model, num_features = length(cover_varimp))
+cc_varimp_fig <- vip(cc_ranger_model, num_features = length(cc_varimp))
+ggsave(
+  file.path(out_dir, paste0(
+    proj, "_sagebrush_probability_model_importance.png"
+  )),
+  plot = prob_varimp_fig, width = 6.5, height = 6.5, units = "in"
+)
+ggsave(
+  file.path(out_dir, paste0(
+    proj, "_sagebrush_cover_model_importance.png"
+  )),
+  plot = cover_varimp_fig, width = 6.5, height = 6.5, units = "in"
+)
+ggsave(
+  file.path(out_dir, paste0(
+    proj, "_sagebrush_cover_class_model_importance.png"
+  )),
+  plot = cc_varimp_fig, width = 6.5, height = 6.5, units = "in"
+)
+
+# Tune results
+prob_tune <- c(
+  num.samples = ranger_model$num.samples,
+  num.features = ranger_model$num.independent.variables,
+  num.trees = ranger_model$num.trees,
+  mtry = ranger_model$mtry
+)
+cover_tune <- c(
+  num.samples = cover_ranger_model$num.samples,
+  num.features = cover_ranger_model$num.independent.variables,
+  num.trees = cover_ranger_model$num.trees,
+  mtry = cover_ranger_model$mtry
+)
+cc_tune <- c(
+  num.samples = cc_ranger_model$num.samples,
+  num.features = cc_ranger_model$num.independent.variables,
+  num.trees = cc_ranger_model$num.trees,
+  mtry = cc_ranger_model$mtry
+)
+tune_scores <- data.frame(
+  model = c("probability", "cover", "cover class"),
+  rbind(prob_tune, cover_tune, cc_tune)
+)
+
+# Machine learning metrics
+agg_scores <- data.frame(
+  model = c("probability", "cover", "cover class"),
+  measure = names(c(best_agg_score, cover_best_agg_score, cc_best_agg_score)),
+  score = c(best_agg_score, cover_best_agg_score, cc_best_agg_score)
+)
+write.csv(agg_scores, file.path(
+  out_dir, paste0(proj, "_machine_learning_metrics.csv")
+), row.names = FALSE)
+
+# Model metrics
+mod_scores <- cbind(tune_scores, data.frame(
+  measure = c(
+    "OOB prediction error (Binary Brier score)",
+    "OOB prediction error (RMSE)",
+    "OOB prediction error (%)"
+  ),
+  score = c(
+    ranger_model$prediction.error,
+    sqrt(cover_ranger_model$prediction.error),
+    cc_ranger_model$prediction.error
+  )
+))
+write.csv(mod_scores, file.path(
+  out_dir, paste0(proj, "_model_metrics.csv")
+), row.names = FALSE)
+
+```
