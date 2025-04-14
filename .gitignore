@@ -48,5 +48,5 @@ po/*~
 # RStudio Connect folder
 rsconnect/
 
-# AOI folders
-*_AOI/
+# KML files
+*.kml
