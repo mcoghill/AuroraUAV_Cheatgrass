@@ -46,7 +46,7 @@ if (i) {
 # "Basic Terrain Analysis" tool to proceed. I have notified the SAGA GIS team
 # of this issue, hopefully it will be fixed in future versions.
 if (.Platform$OS.type == "windows") {
-  saga_ver <- "9.6.1"
+  saga_ver <- "9.8.0"
   url <- paste0(
     "https://sourceforge.net/projects/saga-gis/files/SAGA%20-%20",
     strsplit(saga_ver, "\\.")[[1]][1], "/SAGA%20-%20",
